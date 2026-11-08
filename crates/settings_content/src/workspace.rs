@@ -27,6 +27,11 @@ pub struct WorkspaceSettingsContent {
     ///
     /// Default: contained
     pub bottom_dock_layout: Option<BottomDockLayout>,
+    /// Whether to show the project and Git worktree navigator sidebar. Keeps
+    /// visited worktrees running in this window even when AI features are disabled.
+    ///
+    /// Default: false
+    pub worktree_navigator: Option<bool>,
     /// Direction to split horizontally.
     ///
     /// Default: "up"

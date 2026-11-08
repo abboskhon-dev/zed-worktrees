@@ -155,6 +155,73 @@ async fn test_multi_workspace_collapses_when_agent_is_disabled(cx: &mut TestAppC
 }
 
 #[gpui::test]
+async fn test_worktree_navigator_retains_workspaces_without_ai(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs, ["/root_b".as_ref()], cx).await;
+
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.workspace.worktree_navigator = Some(true);
+            });
+        });
+        DisableAiSettings::override_global(DisableAiSettings { disable_ai: true }, cx);
+    });
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let workspace_a = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    let workspace_b = multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.test_add_workspace(project_b, window, cx)
+    });
+    cx.run_until_parked();
+
+    multi_workspace.update_in(cx, |mw, window, cx| {
+        assert!(!mw.sidebar_open());
+        assert!(mw.is_workspace_retained(&workspace_a));
+        mw.activate(workspace_a.clone(), None, window, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.update_in(cx, |mw, window, cx| {
+        assert_eq!(mw.workspace(), &workspace_a);
+        assert!(mw.is_workspace_retained(&workspace_b));
+        assert_eq!(mw.workspaces().count(), 2);
+
+        mw.open_sidebar(cx);
+        mw.close_sidebar(window, cx);
+        mw.activate(workspace_b.clone(), None, window, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |mw, _| {
+        assert_eq!(mw.workspace(), &workspace_b);
+        assert!(mw.is_workspace_retained(&workspace_a));
+        assert_eq!(mw.workspaces().count(), 2);
+    });
+
+    cx.update(|_window, cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.workspace.worktree_navigator = Some(false);
+            });
+        });
+        DisableAiSettings::override_global(DisableAiSettings { disable_ai: true }, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |mw, _| {
+        assert_eq!(mw.workspaces().count(), 1);
+        assert_eq!(mw.workspace(), &workspace_b);
+    });
+}
+
+#[gpui::test]
 async fn test_project_group_keys_initial(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());

@@ -3255,6 +3255,101 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_worktree_switch_keeps_terminal_process_and_background_output(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.workspace.worktree_navigator = Some(true);
+                    settings.terminal.get_or_insert_default().project.shell =
+                        Some(settings::Shell::Program("/bin/sh".into()));
+                });
+            });
+            project::DisableAiSettings::register(cx);
+            project::DisableAiSettings::override_global(
+                project::DisableAiSettings { disable_ai: true },
+                cx,
+            );
+        });
+        let (window_handle, panel) = init_workspace_with_panel(cx).await;
+        let other_project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let original_workspace = window_handle
+            .read_with(&cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let terminal = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.add_terminal_shell(false, None, RevealStrategy::Always, window, cx)
+            })
+            .await
+            .expect("shell starts");
+        let original_pid = terminal
+            .read_with(&cx, |terminal, _| {
+                terminal.pid_getter().expect("live PTY").fallback_pid()
+            })
+            .unwrap();
+        window_handle
+            .update(&mut cx, |mw, window, cx| {
+                mw.test_add_workspace(other_project, window, cx);
+                mw.close_sidebar(window, cx);
+                assert_eq!(mw.workspaces().count(), 2);
+                assert!(mw.is_workspace_retained(&original_workspace));
+            })
+            .unwrap();
+        terminal
+            .update(&mut cx, |terminal, _| {
+                terminal.input(b"printf 'background-%s\\n' 'still-alive'\r".to_vec());
+            })
+            .unwrap();
+        let live_terminal = terminal
+            .upgrade()
+            .expect("terminal survives switching away");
+        let mut output = String::new();
+        for _ in 0..100 {
+            cx.run_until_parked();
+            output = live_terminal.read_with(&cx, |terminal, _| terminal.get_content());
+            if output.contains("background-still-alive") {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        assert!(
+            output.contains("background-still-alive"),
+            "background shell output: {output:?}"
+        );
+        drop(live_terminal);
+        window_handle
+            .update(&mut cx, |mw, window, cx| {
+                mw.activate(original_workspace.clone(), None, window, cx);
+                assert_eq!(mw.workspace(), &original_workspace);
+                assert_eq!(mw.workspaces().count(), 2);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            let view = panel
+                .active_pane
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.downcast::<TerminalView>())
+                .expect("original terminal tab");
+            assert_eq!(view.read(cx).terminal().downgrade(), terminal);
+        });
+        terminal
+            .read_with(&cx, |terminal, _| {
+                assert_eq!(terminal.pid_getter().unwrap().fallback_pid(), original_pid);
+                assert!(terminal.get_content().contains("background-still-alive"));
+            })
+            .unwrap();
+    }
+
     async fn init_workspace_with_panel(
         cx: &mut TestAppContext,
     ) -> (gpui::WindowHandle<MultiWorkspace>, Entity<TerminalPanel>) {

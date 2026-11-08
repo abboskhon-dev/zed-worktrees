@@ -427,6 +427,27 @@ pub fn build_window_options(display_uuid: Option<Uuid>, cx: &mut App) -> WindowO
     }
 }
 
+fn install_workspace_sidebar(
+    multi_workspace: Entity<MultiWorkspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if WorkspaceSettings::get_global(cx).worktree_navigator {
+        let sidebar = cx.new(|cx| {
+            git_ui::worktree_navigator::WorktreeNavigator::new(multi_workspace.clone(), window, cx)
+        });
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.register_sidebar(sidebar, cx);
+            multi_workspace.open_sidebar(cx);
+        });
+    } else {
+        let sidebar = cx.new(|cx| Sidebar::new(multi_workspace.clone(), window, cx));
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.register_sidebar(sidebar, cx);
+        });
+    }
+}
+
 pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
     let mut _on_close_subscription = bind_on_window_closed(cx);
     cx.observe_global::<SettingsStore>(move |cx| {
@@ -501,6 +522,25 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 .unwrap_or(true)
         });
 
+        let mut navigator_enabled = WorkspaceSettings::get_global(cx).worktree_navigator;
+        cx.observe_global_in::<SettingsStore>(window, move |_, window, cx| {
+            let enabled = WorkspaceSettings::get_global(cx).worktree_navigator;
+            if enabled == navigator_enabled {
+                return;
+            }
+            navigator_enabled = enabled;
+            let multi_workspace = cx.entity();
+            let window_handle = window.window_handle();
+            cx.defer(move |cx| {
+                window_handle
+                    .update(cx, |_, window, cx| {
+                        install_workspace_sidebar(multi_workspace, window, cx);
+                    })
+                    .log_err();
+            });
+        })
+        .detach();
+
         let window_handle = window.window_handle();
         let multi_workspace_handle = cx.entity();
         cx.subscribe_in(
@@ -538,11 +578,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         cx.defer(move |cx| {
             window_handle
                 .update(cx, |_, window, cx| {
-                    let sidebar =
-                        cx.new(|cx| Sidebar::new(multi_workspace_handle.clone(), window, cx));
-                    multi_workspace_handle.update(cx, |multi_workspace, cx| {
-                        multi_workspace.register_sidebar(sidebar, cx);
-                    });
+                    install_workspace_sidebar(multi_workspace_handle.clone(), window, cx);
                 })
                 .ok();
         });

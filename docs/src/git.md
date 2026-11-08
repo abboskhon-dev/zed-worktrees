@@ -9,6 +9,31 @@ Zed has built-in Git support that lets you manage version control without leavin
 
 For operations that Zed doesn't support natively, you can use the integrated terminal.
 
+## Worktree Navigator
+
+This fork includes an optional project and Git worktree sidebar. Enable it in your user settings:
+
+```json
+{
+  "worktree_navigator": true
+}
+```
+
+The sidebar appears on the right, alongside the existing Git panel, diff editor and terminal panel.
+Use **Add project** to open a local project in the same window. Expand a project to see its main
+checkout and linked Git worktrees, including worktrees created from the command line. Use the refresh
+button to reload the list; it also refreshes when the window regains focus.
+
+Selecting a worktree opens its workspace in the background before switching to it. Visited workspaces
+keep their terminals and open tabs while another worktree is selected, even with built-in AI disabled
+or the sidebar hidden. Empty workspaces open Zed's native diff using the configured `git.diff_base`.
+Existing workspaces restore their current editor tab, including commit or branch diffs opened for review.
+
+Projects, visited workspaces and sidebar width use Zed's normal session storage. Terminal processes stay
+alive while switching within the running application; they are not resumed after quitting Zed.
+This first version supports local projects with one repository root. Worktree creation, setup and deletion
+remain available through the existing Git commands and your shell tools.
+
 ## Repository Activation
 
 When a project is rooted at a git repository, or at a subdirectory of one, all repositories in it are active immediately.

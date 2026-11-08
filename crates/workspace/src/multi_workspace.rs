@@ -28,7 +28,7 @@ const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 use crate::open_remote_project_with_existing_connection;
 use crate::{
     CloseIntent, CloseWindow, DockPosition, Event as WorkspaceEvent, Item, ModalView, OpenMode,
-    Panel, Workspace, WorkspaceId, client_side_decorations,
+    Panel, Workspace, WorkspaceId, WorkspaceSettings, client_side_decorations,
     persistence::model::MultiWorkspaceState,
 };
 
@@ -348,9 +348,7 @@ impl MultiWorkspace {
             }
         });
         let settings_subscription = cx.observe_global_in::<settings::SettingsStore>(window, {
-            let mut previous_multi_workspace_enabled = !DisableAiSettings::get_global(cx)
-                .disable_ai
-                && AgentSettings::get_global(cx).enabled;
+            let mut previous_multi_workspace_enabled = Self::multi_workspace_setting_enabled(cx);
             move |this, window, cx| {
                 let multi_workspace_enabled = this.multi_workspace_enabled(cx);
                 if previous_multi_workspace_enabled && !multi_workspace_enabled {
@@ -424,7 +422,13 @@ impl MultiWorkspace {
     }
 
     pub fn multi_workspace_enabled(&self, cx: &App) -> bool {
-        !DisableAiSettings::get_global(cx).disable_ai && AgentSettings::get_global(cx).enabled
+        Self::multi_workspace_setting_enabled(cx)
+    }
+
+    fn multi_workspace_setting_enabled(cx: &App) -> bool {
+        WorkspaceSettings::get_global(cx).worktree_navigator
+            || (!DisableAiSettings::get_global(cx).disable_ai
+                && AgentSettings::get_global(cx).enabled)
     }
 
     pub fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {

@@ -95,6 +95,8 @@
   // Layout mode of the bottom dock. Defaults to "contained"
   //   choices: contained, full, left_aligned, right_aligned
   "bottom_dock_layout": "contained",
+  // Whether to show the project and Git worktree navigator sidebar.
+  "worktree_navigator": false,
   // The direction that you want to split panes horizontally. Defaults to "down"
   "pane_split_direction_horizontal": "down",
   // The direction that you want to split panes vertically. Defaults to "right"
