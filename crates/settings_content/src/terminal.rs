@@ -180,6 +180,10 @@ pub struct TerminalSettingsContent {
     /// Default: true
     pub button: Option<bool>,
     pub dock: Option<TerminalDockPosition>,
+    /// Where to show terminal tabs: above each pane or in a list on the right.
+    ///
+    /// Default: right
+    pub tab_bar_position: Option<TerminalTabBarPosition>,
     /// Whether the terminal panel should open on startup.
     ///
     /// Default: false
@@ -243,7 +247,7 @@ crate::fallible_options::flattened_deserialize!(TerminalSettingsContent {
     options: {
         font_size, font_family, font_fallbacks, line_height, font_features, font_weight,
         cursor_shape, blinking, alternate_scroll, option_as_meta, copy_on_select,
-        keep_selection_on_copy, open_links_in_mouse_mode, button, dock, starts_open, flexible,
+        keep_selection_on_copy, open_links_in_mouse_mode, button, dock, tab_bar_position, starts_open, flexible,
         default_width, default_height, max_scroll_history_lines, scroll_multiplier, toolbar,
         scrollbar, minimum_contrast, show_count_badge, bell,
     },
@@ -609,6 +613,13 @@ impl PathHyperlinkRegex {
 pub enum TerminalDockPosition {
     Left,
     Bottom,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalTabBarPosition {
+    Top,
     Right,
 }
 

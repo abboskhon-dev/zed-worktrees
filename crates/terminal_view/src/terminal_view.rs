@@ -1576,31 +1576,13 @@ impl Render for TerminalView {
     }
 }
 
-impl Item for TerminalView {
-    type Event = ItemEvent;
-
-    fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
-        Some(TabTooltipContent::Custom(Box::new(Tooltip::element({
-            let terminal = self.terminal().read(cx);
-            let title = terminal.title(false);
-            let pid = terminal.pid_getter()?.fallback_pid();
-
-            move |_, _| {
-                v_flex()
-                    .gap_1()
-                    .child(Label::new(title.clone()))
-                    .child(h_flex().flex_grow_1().child(Divider::horizontal()))
-                    .child(
-                        Label::new(format!("Process ID (PID): {}", pid))
-                            .color(Color::Muted)
-                            .size(LabelSize::Small),
-                    )
-                    .into_any_element()
-            }
-        }))))
-    }
-
-    fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
+impl TerminalView {
+    pub(crate) fn render_tab_content(
+        &self,
+        params: TabContentParams,
+        track_focus: bool,
+        cx: &App,
+    ) -> AnyElement {
         let terminal = self.terminal().read(cx);
         let title = self
             .custom_title
@@ -1638,7 +1620,7 @@ impl Item for TerminalView {
         h_flex()
             .gap_1()
             .group("term-tab-icon")
-            .when(!params.selected, |this| {
+            .when(track_focus && !params.selected, |this| {
                 this.track_focus(&self.focus_handle)
             })
             .on_action(move |action: &RenameTerminal, window, cx| {
@@ -1702,6 +1684,35 @@ impl Item for TerminalView {
                     }),
             )
             .into_any()
+    }
+}
+
+impl Item for TerminalView {
+    type Event = ItemEvent;
+
+    fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
+        Some(TabTooltipContent::Custom(Box::new(Tooltip::element({
+            let terminal = self.terminal().read(cx);
+            let title = terminal.title(false);
+            let pid = terminal.pid_getter()?.fallback_pid();
+
+            move |_, _| {
+                v_flex()
+                    .gap_1()
+                    .child(Label::new(title.clone()))
+                    .child(h_flex().flex_grow_1().child(Divider::horizontal()))
+                    .child(
+                        Label::new(format!("Process ID (PID): {}", pid))
+                            .color(Color::Muted)
+                            .size(LabelSize::Small),
+                    )
+                    .into_any_element()
+            }
+        }))))
+    }
+
+    fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
+        self.render_tab_content(params, true, cx)
     }
 
     fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString {

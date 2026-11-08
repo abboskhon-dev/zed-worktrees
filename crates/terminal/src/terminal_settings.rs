@@ -7,8 +7,8 @@ pub use settings::AlternateScroll;
 
 use settings::{
     IntoGpui, PathHyperlinkRegex, RegisterSetting, ShowScrollbar, TerminalBell, TerminalBlink,
-    TerminalDockPosition, TerminalLineHeight, VenvSettings, WorkingDirectory,
-    merge_from::MergeFrom,
+    TerminalDockPosition, TerminalLineHeight, TerminalTabBarPosition, VenvSettings,
+    WorkingDirectory, merge_from::MergeFrom,
 };
 use task::Shell;
 use theme_settings::FontFamilyName;
@@ -38,6 +38,7 @@ pub struct TerminalSettings {
     pub open_links_in_mouse_mode: bool,
     pub button: bool,
     pub dock: TerminalDockPosition,
+    pub tab_bar_position: TerminalTabBarPosition,
     pub starts_open: bool,
     pub flexible: bool,
     pub default_width: Pixels,
@@ -110,6 +111,7 @@ impl settings::Settings for TerminalSettings {
             open_links_in_mouse_mode: user_content.open_links_in_mouse_mode.unwrap(),
             button: user_content.button.unwrap(),
             dock: user_content.dock.unwrap(),
+            tab_bar_position: user_content.tab_bar_position.unwrap(),
             starts_open: user_content.starts_open.unwrap(),
             default_width: user_content.default_width.unwrap().into_gpui(),
             default_height: user_content.default_height.unwrap().into_gpui(),

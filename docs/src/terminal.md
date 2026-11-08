@@ -30,6 +30,25 @@ Create additional terminals with `Cmd+N` (macOS) or `Ctrl+N` (Linux/Windows) whi
 
 Split terminals horizontally with `Cmd+D` (macOS) or `Ctrl+Shift+5` (Linux/Windows).
 
+### Terminal Tab Position
+
+Terminal tabs appear in a resizable list on the right of the panel. The list
+includes terminals from every split pane. Click a terminal to focus it,
+double-click to rename it, or hover to reveal its close button. Drag the divider
+to resize the list, or double-click the divider to reset its width.
+
+To show tabs above each pane instead, set `tab_bar_position` to `"top"`:
+
+```json [settings]
+{
+  "terminal": {
+    "tab_bar_position": "top"
+  }
+}
+```
+
+Switching between `"top"` and `"right"` keeps your running terminals and splits.
+
 ## Configuring the Shell
 
 By default, Zed uses your system's default shell (from `/etc/passwd` on Unix systems). To use a different shell:

@@ -946,6 +946,7 @@ impl VsCodeSettings {
             default_height: None,
             default_width: None,
             dock: None,
+            tab_bar_position: None,
             starts_open: None,
             font_fallbacks,
             font_family,
