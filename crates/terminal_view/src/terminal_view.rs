@@ -20,7 +20,8 @@ use project::{Project, ProjectEntryId, search::SearchQuery};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{
-    SeedQuerySetting, Settings, SettingsStore, TerminalBell, TerminalBlink, WorkingDirectory,
+    SeedQuerySetting, Settings, SettingsStore, TerminalBell, TerminalBlink, TerminalTabBarPosition,
+    WorkingDirectory,
 };
 use std::{
     any::Any,
@@ -77,6 +78,37 @@ fn viewport_line_for_point(point: Point, display_offset: usize) -> Option<usize>
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+
+fn compact_terminal_title(title: &str, command: Option<&str>) -> String {
+    let Some((_, process)) = title.split_once(" — ") else {
+        return title.to_string();
+    };
+    let normalized = process.replace('\\', "/");
+    let executable = process.split_whitespace().next().unwrap_or("");
+    let executable = executable.rsplit(['/', '\\']).next().unwrap_or(executable);
+    if matches!(executable.trim_end_matches(".exe"), "node" | "bun" | "deno") {
+        for (script, label) in [
+            ("/claude-code/", "claude"),
+            ("/@openai/codex/", "codex"),
+            ("/npm-cli.js", "npm"),
+            ("/npx-cli.js", "npx"),
+        ] {
+            if normalized.contains(script) {
+                return label.into();
+            }
+        }
+    }
+    let name = command
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| process.split_whitespace().next())
+        .unwrap_or("Terminal");
+    let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    match name.trim_end_matches(".exe") {
+        "npm-cli" | "npm-cli.js" => "npm".into(),
+        "npx-cli" | "npx-cli.js" => "npx".into(),
+        name => name.to_string(),
+    }
+}
 
 /// Event to transmit the scroll from the element to the view
 #[derive(Clone, Debug, PartialEq)]
@@ -520,7 +552,7 @@ impl TerminalView {
             } else {
                 // Only set custom_title if the text differs from the terminal's dynamic title.
                 // This prevents subtle layout changes when clicking away without making changes.
-                let terminal_title = self.terminal.read(cx).title(true);
+                let terminal_title = self.dynamic_tab_title(cx);
                 if new_label == terminal_title {
                     None
                 } else {
@@ -546,7 +578,7 @@ impl TerminalView {
         let current_label = self
             .custom_title
             .clone()
-            .unwrap_or_else(|| self.terminal.read(cx).title(true));
+            .unwrap_or_else(|| self.dynamic_tab_title(cx));
 
         let rename_editor = cx.new(|cx| Editor::single_line(window, cx));
         let rename_editor_subscription = cx.subscribe_in(&rename_editor, window, {
@@ -1593,6 +1625,18 @@ impl Render for TerminalView {
 }
 
 impl TerminalView {
+    fn dynamic_tab_title(&self, cx: &App) -> String {
+        let terminal = self.terminal().read(cx);
+        if TerminalSettings::get_global(cx).tab_bar_position == TerminalTabBarPosition::Right
+            && terminal.task().is_none()
+        {
+            let command = terminal.foreground_process_command_name();
+            compact_terminal_title(&terminal.title(false), command.as_deref())
+        } else {
+            terminal.title(true)
+        }
+    }
+
     pub(crate) fn render_tab_content(
         &self,
         params: TabContentParams,
@@ -1605,7 +1649,7 @@ impl TerminalView {
             .as_ref()
             .filter(|title| !title.trim().is_empty())
             .cloned()
-            .unwrap_or_else(|| terminal.title(true));
+            .unwrap_or_else(|| self.dynamic_tab_title(cx));
 
         let (icon, icon_color, rerun_button) = match terminal.task() {
             Some(terminal_task) => match &terminal_task.status {
@@ -1735,8 +1779,11 @@ impl Item for TerminalView {
         if let Some(custom_title) = self.custom_title.as_ref().filter(|l| !l.trim().is_empty()) {
             return custom_title.clone().into();
         }
-        let terminal = self.terminal().read(cx);
-        terminal.title(detail == 0).into()
+        if detail == 0 {
+            self.dynamic_tab_title(cx).into()
+        } else {
+            self.terminal().read(cx).title(false).into()
+        }
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
@@ -2347,6 +2394,54 @@ mod tests {
     use util::rel_path::RelPath;
     use workspace::item::test::{TestItem, TestProjectItem};
     use workspace::{AppState, MultiWorkspace, SelectedEntry};
+
+    #[test]
+    fn compact_terminal_labels_show_the_command_instead_of_the_project() {
+        for (title, command, expected) in [
+            ("project — claude --resume", Some("claude"), "claude"),
+            ("another-project — codex resume", Some("codex"), "codex"),
+            ("project — npm run dev", None, "npm"),
+            ("project — /usr/bin/zsh", None, "zsh"),
+            ("Terminal", None, "Terminal"),
+            ("My custom terminal", Some("node"), "My custom terminal"),
+            ("project — vim /src/claude-code/cli.js", Some("vim"), "vim"),
+        ] {
+            assert_eq!(compact_terminal_title(title, command), expected);
+        }
+    }
+
+    #[test]
+    fn compact_terminal_labels_recognize_node_cli_wrappers() {
+        for (title, command, expected) in [
+            (
+                "project — node /opt/node_modules/@anthropic-ai/claude-code/cli.js",
+                Some("cli"),
+                "claude",
+            ),
+            (
+                "project — node /opt/node_modules/@openai/codex/bin/codex.js",
+                Some("codex"),
+                "codex",
+            ),
+            (
+                "project — node /opt/node_modules/npm/bin/npm-cli.js run dev",
+                Some("npm-cli"),
+                "npm",
+            ),
+            (
+                "project — node /opt/node_modules/npm/bin/npx-cli.js vite",
+                Some("npx-cli"),
+                "npx",
+            ),
+            (
+                "project — node /opt/node_modules/npm/bin/npm-cli.js run dev",
+                None,
+                "npm",
+            ),
+        ] {
+            assert_eq!(compact_terminal_title(title, command), expected);
+        }
+    }
 
     fn expected_drop_text(paths: &[PathBuf]) -> String {
         let mut text = String::new();
