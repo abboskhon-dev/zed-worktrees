@@ -33,9 +33,22 @@ keep their terminals and open tabs while another worktree is selected, even with
 or the sidebar hidden. Empty workspaces open Zed's native diff using the configured `git.diff_base`.
 Existing workspaces restore their current editor tab, including commit or branch diffs opened for review.
 
+Click the pin beside a worktree to move it to the top of its project. Pins, collapsed projects and removed
+sidebar entries are saved across restarts. Right-click a row to remove it from the sidebar without touching
+its files or sessions, or use the close button on a project heading to hide the whole project. Use
+**Restore removed entries** to show those entries again; adding the project again also restores it.
+
+The trash button on a linked worktree opens **Delete worktree…**. After confirmation, Zed closes any workspace
+containing that folder using its normal save/close prompts, then asks Git to remove the worktree directory.
+The branch is kept. The main checkout cannot be deleted, and Git refuses to remove dirty or locked worktrees.
+Canceling either confirmation keeps the folder. Saved folders such as agent scratchpads have no Git deletion action.
+
+Saved multi-folder layouts are reduced to individual folder entries and folded into their corresponding
+repository when it is available, so they do not repeat an already listed repository or worktree.
+
 Projects, visited workspaces and sidebar width use Zed's normal session storage. Terminal processes stay
 alive while switching within the running application; they are not resumed after quitting Zed.
-This first version supports local projects with one repository root. Worktree creation, setup and deletion
+This first version supports local projects with one repository root. Worktree creation and setup
 remain available through the existing Git commands and your shell tools.
 
 ## Repository Activation
