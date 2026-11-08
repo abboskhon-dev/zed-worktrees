@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, ensure};
-use collections::HashSet;
+use collections::{HashMap, HashSet};
 use git::repository::Worktree as GitWorktree;
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, ScrollHandle, Subscription,
@@ -19,6 +19,7 @@ use workspace::{
 
 use crate::{branch_diff::BranchDiff, project_diff::ProjectDiff};
 
+#[derive(PartialEq, Eq)]
 struct ProjectEntry {
     key: ProjectGroupKey,
     worktrees: Vec<GitWorktree>,
@@ -42,7 +43,7 @@ pub struct WorktreeNavigator {
     refresh_task: Option<Task<()>>,
     open_tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
-    repository_subscriptions: Vec<Subscription>,
+    repository_subscriptions: HashMap<gpui::EntityId, Subscription>,
 }
 
 impl WorktreeNavigator {
@@ -61,8 +62,8 @@ impl WorktreeNavigator {
                 &multi_workspace,
                 window,
                 |this, _, event, window, cx| match event {
-                    MultiWorkspaceEvent::ActiveWorkspaceChanged { .. }
-                    | MultiWorkspaceEvent::WorkspaceAdded(_)
+                    MultiWorkspaceEvent::ActiveWorkspaceChanged { .. } => cx.notify(),
+                    MultiWorkspaceEvent::WorkspaceAdded(_)
                     | MultiWorkspaceEvent::WorkspaceRemoved(_)
                     | MultiWorkspaceEvent::ProjectGroupsChanged => this.refresh(window, cx),
                 },
@@ -86,7 +87,7 @@ impl WorktreeNavigator {
             refresh_task: None,
             open_tasks: Vec::new(),
             _subscriptions: subscriptions,
-            repository_subscriptions: Vec::new(),
+            repository_subscriptions: HashMap::default(),
         }
     }
 
@@ -95,8 +96,8 @@ impl WorktreeNavigator {
             return;
         };
         let groups = multi_workspace.read(cx).project_groups(cx);
-        let mut requests = Vec::new();
-        self.repository_subscriptions.clear();
+        let mut projects = Vec::new();
+        let mut observed_stores = HashSet::default();
         for group in groups
             .into_iter()
             .filter(|group| group.key.host().is_none())
@@ -109,47 +110,103 @@ impl WorktreeNavigator {
                 .and_then(|workspace| workspace.read(cx).project().read(cx).active_repository(cx));
             if let Some(workspace) = representative {
                 let git_store = workspace.read(cx).project().read(cx).git_store().clone();
-                self.repository_subscriptions.push(cx.subscribe_in(
-                    &git_store,
-                    window,
-                    |this, _, event, window, cx| {
-                        if matches!(
-                            event,
-                            GitStoreEvent::RepositoryAdded
-                                | GitStoreEvent::RepositoryRemoved(_)
-                                | GitStoreEvent::RepositoryUpdated(
-                                    _,
-                                    RepositoryEvent::GitWorktreeListChanged
-                                        | RepositoryEvent::HeadChanged,
-                                    _
-                                )
-                        ) {
-                            this.refresh(window, cx);
-                        }
-                    },
-                ));
+                let store_id = git_store.entity_id();
+                observed_stores.insert(store_id);
+                self.repository_subscriptions
+                    .entry(store_id)
+                    .or_insert_with(|| {
+                        cx.subscribe_in(&git_store, window, |this, _, event, window, cx| {
+                            if matches!(
+                                event,
+                                GitStoreEvent::RepositoryAdded
+                                    | GitStoreEvent::RepositoryRemoved(_)
+                                    | GitStoreEvent::RepositoryUpdated(
+                                        _,
+                                        RepositoryEvent::GitWorktreeListChanged
+                                            | RepositoryEvent::HeadChanged,
+                                        _
+                                    )
+                            ) {
+                                this.refresh(window, cx);
+                            }
+                        })
+                    });
             }
-            requests.push((
-                group.key,
-                repository.map(|repository| repository.update(cx, |repo, _| repo.worktrees())),
-            ));
+            let mut worktrees = Vec::new();
+            if let Some(repository) = repository {
+                // The Git store already discovers linked worktrees during its scans.
+                // Reading that snapshot avoids spawning another Git process per project.
+                let snapshot = repository.read(cx).snapshot();
+                worktrees.extend(snapshot.linked_worktrees().iter().cloned());
+                worktrees.push(GitWorktree {
+                    path: snapshot.work_directory_abs_path.to_path_buf(),
+                    ref_name: snapshot
+                        .branch
+                        .as_ref()
+                        .map(|branch| branch.name().to_string().into()),
+                    sha: snapshot
+                        .head_commit
+                        .as_ref()
+                        .map(|commit| commit.sha.clone())
+                        .unwrap_or_default(),
+                    is_main: snapshot.is_main_worktree(),
+                    is_bare: false,
+                });
+                sort_worktrees(&mut worktrees);
+            }
+            projects.push(ProjectEntry {
+                key: group.key,
+                worktrees,
+                error: None,
+            });
         }
+        self.repository_subscriptions
+            .retain(|id, _| observed_stores.contains(id));
+        if self.projects != projects {
+            self.projects = projects;
+            cx.notify();
+        }
+    }
+
+    fn refresh_from_git(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A burst of refresh clicks should not enqueue duplicate Git jobs. Dropping
+        // the receiver does not cancel a job already in the repository's queue.
+        if self
+            .refresh_task
+            .as_ref()
+            .is_some_and(|task| !task.is_ready())
+        {
+            return;
+        }
+        self.refresh(window, cx);
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let groups = multi_workspace.read(cx).project_groups(cx);
+        let requests: Vec<_> = groups
+            .into_iter()
+            .filter(|group| group.key.host().is_none())
+            .filter_map(|group| {
+                let repository = group.workspaces.iter().find_map(|workspace| {
+                    let project = workspace.read(cx).project().read(cx);
+                    project
+                        .is_local()
+                        .then(|| project.active_repository(cx))
+                        .flatten()
+                })?;
+                Some((group.key, repository.update(cx, |repo, _| repo.worktrees())))
+            })
+            .collect();
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
-            let projects =
+            let updates =
                 futures::future::join_all(requests.into_iter().map(|(key, request)| async move {
-                    let result: Result<Vec<GitWorktree>> = match request {
-                        Some(request) => request
-                            .await
-                            .context("Git worktree request cancelled")
-                            .and_then(|result| result),
-                        None => Ok(Vec::new()),
-                    };
+                    let result = request
+                        .await
+                        .context("Git worktree request cancelled")
+                        .and_then(|result| result);
                     match result {
                         Ok(mut worktrees) => {
-                            worktrees.retain(|worktree| !worktree.is_bare);
-                            worktrees.sort_by(|a, b| {
-                                b.is_main.cmp(&a.is_main).then_with(|| a.path.cmp(&b.path))
-                            });
+                            sort_worktrees(&mut worktrees);
                             ProjectEntry {
                                 key,
                                 worktrees,
@@ -165,8 +222,21 @@ impl WorktreeNavigator {
                 }))
                 .await;
             this.update(cx, |this, cx| {
-                this.projects = projects;
-                cx.notify();
+                let mut changed = false;
+                for update in updates {
+                    if let Some(project) = this
+                        .projects
+                        .iter_mut()
+                        .find(|project| project.key == update.key)
+                        && *project != update
+                    {
+                        *project = update;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    cx.notify();
+                }
             })
             .log_err();
         }));
@@ -175,6 +245,21 @@ impl WorktreeNavigator {
     fn select_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.requested_path = Some(path.clone());
         self.error = None;
+        if self
+            .multi_workspace
+            .upgrade()
+            .is_some_and(|multi_workspace| {
+                let workspace = multi_workspace.read(cx).workspace().read(cx);
+                workspace.active_item(cx).is_some()
+                    && workspace
+                        .root_paths(cx)
+                        .iter()
+                        .any(|root| root.as_ref() == path.as_path())
+            })
+        {
+            cx.notify();
+            return;
+        }
         cx.notify();
         // Keep in-flight opens alive. Cancelling a workspace load halfway through
         // can leave it registered without completing its panel restoration.
@@ -316,6 +401,11 @@ impl WorktreeNavigator {
         })
         .detach();
     }
+}
+
+fn sort_worktrees(worktrees: &mut Vec<GitWorktree>) {
+    worktrees.retain(|worktree| !worktree.is_bare);
+    worktrees.sort_by(|a, b| b.is_main.cmp(&a.is_main).then_with(|| a.path.cmp(&b.path)));
 }
 
 fn worktree_label(worktree: &GitWorktree) -> SharedString {
@@ -508,7 +598,11 @@ impl Render for WorktreeNavigator {
                     .child(
                         IconButton::new("refresh-worktrees", IconName::ArrowCircle)
                             .tooltip(Tooltip::text("Refresh worktrees"))
-                            .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.refresh_from_git(window, cx)
+                                }),
+                            ),
                     ),
             )
             .child(
@@ -558,6 +652,61 @@ mod tests {
     use settings::{Settings, SettingsStore};
     use std::{path::Path, sync::Arc};
     use util::path;
+
+    fn worktree_queries(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> usize {
+        workspace.read_with(cx, |workspace, cx| {
+            let repository = workspace.project().read(cx).active_repository(cx).unwrap();
+            let jobs = repository.read(cx).job_debug_queue().to_debug_value();
+            jobs["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|job| job["description"] == "worktrees")
+                .count()
+        })
+    }
+
+    #[gpui::test]
+    async fn switching_does_not_enqueue_worktree_queries(cx: &mut TestAppContext) {
+        let (_fs, _multi_workspace, navigator, workspace_a, workspace_b, mut cx) = setup(cx).await;
+        let before = (
+            worktree_queries(&workspace_a, &cx),
+            worktree_queries(&workspace_b, &cx),
+        );
+        for _ in 0..10 {
+            for path in [path!("/project-a"), path!("/project-b")] {
+                navigator.update_in(&mut cx, |nav, window, cx| {
+                    nav.select_path(path.into(), window, cx)
+                });
+                cx.run_until_parked();
+            }
+        }
+        let after = (
+            worktree_queries(&workspace_a, &cx),
+            worktree_queries(&workspace_b, &cx),
+        );
+        assert_eq!(after, before, "switching should reuse Git store snapshots");
+    }
+
+    #[gpui::test]
+    async fn repeated_manual_refresh_is_coalesced(cx: &mut TestAppContext) {
+        let (_fs, _multi_workspace, navigator, workspace_a, workspace_b, mut cx) = setup(cx).await;
+        let before = (
+            worktree_queries(&workspace_a, &cx),
+            worktree_queries(&workspace_b, &cx),
+        );
+        navigator.update_in(&mut cx, |nav, window, cx| {
+            for _ in 0..10 {
+                nav.refresh_from_git(window, cx);
+            }
+        });
+        cx.run_until_parked();
+        let after = (
+            worktree_queries(&workspace_a, &cx),
+            worktree_queries(&workspace_b, &cx),
+        );
+        assert_eq!(after, (before.0 + 1, before.1 + 1));
+    }
 
     async fn setup(
         cx: &mut TestAppContext,

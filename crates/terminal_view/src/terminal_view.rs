@@ -1211,6 +1211,8 @@ fn subscribe_for_terminal_events(
 ) -> Vec<Subscription> {
     let terminal_subscription = cx.observe(terminal, |_, _, cx| cx.notify());
     let mut previous_cwd = None;
+    let mut previous_title = terminal.read(cx).title(false);
+    let mut previous_task_status = terminal.read(cx).task().map(|task| task.status);
     let terminal_events_subscription = cx.subscribe_in(
         terminal,
         window,
@@ -1226,7 +1228,16 @@ fn subscribe_for_terminal_events(
                     cx.notify();
                     window.invalidate_character_coordinates();
                     cx.emit(Event::Wakeup);
-                    cx.emit(ItemEvent::UpdateTab);
+                    let terminal = terminal.read(cx);
+                    let title = terminal.title(false);
+                    let task_status = terminal.task().map(|task| task.status);
+                    // Output wakes the terminal frequently. Only metadata changes need
+                    // to invalidate the containing pane and the whole terminal tab list.
+                    if title != previous_title || task_status != previous_task_status {
+                        previous_title = title;
+                        previous_task_status = task_status;
+                        cx.emit(ItemEvent::UpdateTab);
+                    }
                     cx.emit(SearchEvent::MatchesInvalidated);
                 }
 
@@ -1245,6 +1256,9 @@ fn subscribe_for_terminal_events(
                 }
 
                 Event::Bell => {
+                    if !terminal_view.has_bell {
+                        cx.emit(ItemEvent::UpdateTab);
+                    }
                     terminal_view.has_bell = true;
                     if let TerminalBell::System = TerminalSettings::get_global(cx).bell {
                         window.play_system_bell();
@@ -1272,6 +1286,8 @@ fn subscribe_for_terminal_events(
                 }
 
                 Event::TitleChanged => {
+                    previous_title = terminal.read(cx).title(false);
+                    previous_task_status = terminal.read(cx).task().map(|task| task.status);
                     cx.emit(ItemEvent::UpdateTab);
                 }
 
@@ -2365,6 +2381,66 @@ mod tests {
         let written =
             String::from_utf8(input_log.remove(0)).expect("terminal write should be valid UTF-8");
         assert_eq!(written, expected_text);
+    }
+
+    #[gpui::test]
+    async fn plain_output_does_not_refresh_terminal_tabs(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, false, true, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.run_until_parked();
+        let tab_updates = Rc::new(std::cell::Cell::new(0));
+        let _subscription = terminal_view.update(&mut cx, |_, cx| {
+            cx.subscribe(&terminal_view, {
+                let tab_updates = tab_updates.clone();
+                move |_, _, event, _| {
+                    if matches!(event, ItemEvent::UpdateTab) {
+                        tab_updates.set(tab_updates.get() + 1);
+                    }
+                }
+            })
+        });
+        for _ in 0..10 {
+            terminal.update(&mut cx, |terminal, cx| {
+                terminal.write_output(b"agent output\n", cx)
+            });
+            cx.run_until_parked();
+        }
+        assert!(terminal.read_with(&cx, |terminal, _| {
+            terminal.get_content().contains("agent output")
+        }));
+        assert_eq!(
+            tab_updates.get(),
+            0,
+            "plain output should not invalidate tab layouts"
+        );
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_raw_output(b"\x1b]0;New agent title\x07", cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            terminal.read_with(&cx, |terminal, _| terminal.breadcrumb_text.clone()),
+            "New agent title"
+        );
+        terminal_view.update(&mut cx, |view, cx| {
+            view.set_custom_title(Some("Renamed agent".into()), cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            tab_updates.get() > 0,
+            "renaming a terminal still needs to update its tab"
+        );
+        let after_title = tab_updates.get();
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_raw_output(b"\x07", cx)
+        });
+        cx.run_until_parked();
+        assert!(terminal_view.read_with(&cx, |view, _| view.has_bell()));
+        assert!(
+            tab_updates.get() > after_title,
+            "bell indicators still need to update the tab"
+        );
     }
 
     // DEC private mode 1049: a program writes this to enter the alternate screen buffer.

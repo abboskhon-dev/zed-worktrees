@@ -20,6 +20,75 @@ fn init_test(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+async fn test_worktree_navigator_reuses_rendered_sidebar_on_unrelated_redraws(
+    cx: &mut TestAppContext,
+) {
+    struct CountingSidebar {
+        focus_handle: FocusHandle,
+        renders: Rc<Cell<usize>>,
+    }
+    impl Focusable for CountingSidebar {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+    impl EventEmitter<SidebarEvent> for CountingSidebar {}
+    impl Sidebar for CountingSidebar {
+        fn width(&self, _: &App) -> Pixels {
+            px(240.)
+        }
+        fn set_width(&mut self, _: Option<Pixels>, _: &mut Context<Self>) {}
+        fn has_notifications(&self, _: &App) -> bool {
+            false
+        }
+        fn side(&self, _: &App) -> SidebarSide {
+            SidebarSide::Right
+        }
+    }
+    impl Render for CountingSidebar {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div().size_full()
+        }
+    }
+    init_test(cx);
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.workspace.worktree_navigator = Some(true)
+            });
+        })
+    });
+    let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let renders = Rc::new(Cell::new(0));
+    let sidebar = cx.new(|cx| CountingSidebar {
+        focus_handle: cx.focus_handle(),
+        renders: renders.clone(),
+    });
+    multi_workspace.update(cx, |mw, cx| {
+        mw.register_sidebar(sidebar.clone(), cx);
+        mw.open_sidebar(cx);
+    });
+    let _ = cx.update(|window, cx| window.draw(cx));
+    let initial = renders.get();
+    assert!(initial > 0);
+    for _ in 0..5 {
+        multi_workspace.update(cx, |_, cx| cx.notify());
+        let _ = cx.update(|window, cx| window.draw(cx));
+    }
+    assert_eq!(
+        renders.get(),
+        initial,
+        "unrelated redraws should reuse the sidebar subtree"
+    );
+    sidebar.update(cx, |_, cx| cx.notify());
+    let _ = cx.update(|window, cx| window.draw(cx));
+    assert!(renders.get() > initial, "sidebar changes must still render");
+}
+
 fn setup_multi_workspace<'a>(
     projects: &[Entity<Project>],
     cx: &'a mut TestAppContext,

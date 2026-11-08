@@ -22,7 +22,11 @@ This fork includes an optional project and Git worktree sidebar. Enable it in yo
 The sidebar appears on the right, alongside the existing Git panel, diff editor and terminal panel.
 Use **Add project** to open a local project in the same window. Expand a project to see its main
 checkout and linked Git worktrees, including worktrees created from the command line. Use the refresh
-button to reload the list; it also refreshes when the window regains focus.
+button to query Git directly; normal updates follow Zed’s repository watcher.
+
+Automatic updates reuse Zed's existing repository snapshots. Switching worktrees does not start
+extra Git discovery commands, and repeated refresh clicks share one in-flight request per project.
+The navigator's rendered subtree is cached independently from terminal output.
 
 Selecting a worktree opens its workspace in the background before switching to it. Visited workspaces
 keep their terminals and open tabs while another worktree is selected, even with built-in AI disabled

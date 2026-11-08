@@ -2064,7 +2064,14 @@ impl Render for MultiWorkspace {
                     .h_full()
                     .w(sidebar_width)
                     .flex_shrink_0()
-                    .child(sidebar_handle.to_any())
+                    .child(if WorkspaceSettings::get_global(cx).worktree_navigator {
+                        sidebar_handle
+                            .to_any()
+                            .cached(gpui::StyleRefinement::default().v_flex().size_full())
+                            .into_any_element()
+                    } else {
+                        sidebar_handle.to_any().into_any_element()
+                    })
                     .child(resize_handle)
                     .into_any_element()
             })
