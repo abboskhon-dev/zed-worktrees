@@ -1021,6 +1021,34 @@ impl Dock {
             .map(|entry| entry.size_state)
     }
 
+    pub fn capture_panel_sizes(&self) -> Vec<(&'static str, PanelSizeState)> {
+        self.panel_entries
+            .iter()
+            .map(|entry| (entry.panel.panel_key(), entry.size_state))
+            .collect()
+    }
+
+    pub fn restore_panel_sizes(
+        &mut self,
+        sizes: &[(&str, PanelSizeState)],
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        for entry in &mut self.panel_entries {
+            if let Some((_, size)) = sizes
+                .iter()
+                .find(|(key, _)| *key == entry.panel.panel_key())
+                && entry.size_state != *size
+            {
+                entry.size_state = *size;
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
     pub fn stored_active_panel_size(&self, window: &Window, cx: &App) -> Option<Pixels> {
         if self.is_open {
             self.active_panel_entry().map(|entry| {

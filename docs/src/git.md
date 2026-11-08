@@ -28,10 +28,74 @@ Automatic updates reuse Zed's existing repository snapshots. Switching worktrees
 extra Git discovery commands, and repeated refresh clicks share one in-flight request per project.
 The navigator's rendered subtree is cached independently from terminal output.
 
+For a source installation of this branch, install the dependencies in the upstream
+[macOS build guide](development/macos.md) or the corresponding guide for your operating system, then run:
+
+```sh
+CARGO_PROFILE_RELEASE_DEBUG=0 ZED_RELEASE_CHANNEL=stable \
+ZED_UPDATE_EXPLANATION='Custom worktree build; rebuild from source to update.' \
+cargo build --locked --release -p zed --bin zed
+"${CARGO_TARGET_DIR:-target}/release/zed" /path/to/your/repository
+```
+
+Quit other stable Zed instances before launching this build: stable builds currently share Zed's
+single-instance lock. Keep the same Cargo profile and target directory for subsequent builds to reuse
+the cache. The optimized editor still needs a final link when its UI code changes.
+
 Selecting a worktree opens its workspace in the background before switching to it. Visited workspaces
 keep their terminals and open tabs while another worktree is selected, even with built-in AI disabled
 or the sidebar hidden. Empty workspaces open Zed's native diff using the configured `git.diff_base`.
 Existing workspaces restore their current editor tab, including commit or branch diffs opened for review.
+
+New workspaces inherit the main checkout's open docks, active panels, zoom state and panel dimensions.
+If that checkout is not open, another workspace for the same repository supplies the layout. Otherwise,
+the current workspace supplies it. Saved workspaces keep their own layout. Inheritance runs once, after
+the destination's panels have loaded, and does not copy running terminal processes.
+
+### Agent completion bells
+
+A bell beside a worktree means one of its terminals rang the terminal bell or a terminal task finished.
+The marker stays until you visit the worktree. Ordinary output does not mark a worktree or redraw the
+navigator; subscriptions are shared for each terminal. The navigator does not infer completion from
+silence or parse the agent's output.
+
+For interactive Claude Code, merge this `Stop` hook into your existing `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ \"$TERM_PROGRAM\" = \"zed\" ]; then printf '%s\\n' '{\"terminalSequence\":\"\\u0007\"}'; fi"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+This emits BEL through Claude's terminal after a turn. It leaves existing hooks intact and only emits
+inside Zed. Claude hooks have no controlling terminal, so the hook returns `terminalSequence` instead
+of writing to `/dev/tty`. See the [Claude Code hooks reference](https://code.claude.com/docs/en/hooks#emit-terminal-notifications).
+
+For Codex CLI, add these settings to the existing `[tui]` section of `~/.codex/config.toml`:
+
+```toml
+[tui]
+notifications = ["agent-turn-complete"]
+notification_method = "bel"
+notification_condition = "always"
+```
+
+Using BEL avoids dependence on OSC desktop-notification support. `always` also covers completion while
+the agent's terminal is selected. See the [official Codex notification settings](https://learn.chatgpt.com/docs/config-file/config-advanced#notify-vs-tuinotifications).
+The editor does not change either agent's configuration automatically. Check the marker with
+`printf '\a'` in a terminal, then switch away from that worktree before the command runs if you want
+to test a background notification, for example `sleep 2; printf '\a'`.
 
 Click the pin beside a worktree to move it to the top of its project. Pins, collapsed projects and removed
 sidebar entries are saved across restarts. Right-click a row to remove it from the sidebar without touching

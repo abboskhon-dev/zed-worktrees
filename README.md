@@ -1,51 +1,55 @@
 > [!IMPORTANT]
 > Remove this line to confirm you've reviewed this PR before submitting.
 
-# Zed
+# Zed Worktrees
 
-[![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
-[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
+A Zed fork for reviewing agent work across multiple projects and Git worktrees in one window.
+Based on upstream Zed `v1.26.2`.
 
-Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
+## What this fork adds
 
----
+- A project and Git worktree navigator on the right, alongside Zed’s native Changes, History and diff views.
+- Worktree switching that keeps each workspace’s terminals and open tabs alive.
+- New workspaces that inherit the main checkout’s dock layout and panel sizes.
+- Pinned worktrees, compact controls on hover, and confirmed worktree deletion.
+- Worktree bell indicators for terminal notifications and completed terminal tasks, with setup instructions for Claude Code and Codex.
 
-### Installation
+## Installation and setup
 
-On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
+Build this branch from source using the [installation instructions](docs/src/git.md#worktree-navigator).
+There is no published installer for this fork yet.
 
-Other platforms are not yet available:
+Enable the navigator in your Zed user settings:
 
-- Web ([tracking discussion](https://github.com/zed-industries/zed/discussions/26195))
+```json
+{
+  "worktree_navigator": true
+}
+```
 
-### Developing Zed
+Use **Add project** in the right-hand sidebar to include a repository. Create linked worktrees with
+Git or your existing worktree script; the sidebar discovers them automatically.
 
-- [Building Zed for macOS](./docs/src/development/macos.md)
-- [Building Zed for Linux](./docs/src/development/linux.md)
-- [Building Zed for Windows](./docs/src/development/windows.md)
+Completion bells require your agent to emit a terminal notification. See the
+[Claude Code and Codex setup](docs/src/git.md#agent-completion-bells).
+Terminal processes stay alive while switching workspaces; quitting Zed ends those processes.
 
-### Contributing
+## Credits
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for ways you can contribute to Zed.
+The editor is [Zed](https://github.com/zed-industries/zed), created by **Zed Industries, Inc. and its contributors**.
+This is an unofficial fork maintained by [abboskhon-dev](https://github.com/abboskhon-dev).
+The project and worktree workflow was inspired by **herdr**; its code is not included in this fork.
 
-Also... we're hiring! Check out our [jobs](https://zed.dev/jobs) page for open roles.
+## License
 
-### Licensing
+Zed’s existing copyright and license notices are retained. The source is primarily
+[GPL-3.0-or-later](LICENSE-GPL), with [Apache-2.0](LICENSE-APACHE) components where marked.
+See the original license files and individual component notices for details.
 
-Zed source code is licensed primarily under GPL-3.0-or-later, with Apache-2.0 components where marked.
+## Upstream development
 
-License information for third party dependencies must be correctly provided for CI to pass.
-
-We use [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) to automatically comply with open source licenses. If CI is failing, check the following:
-
-- Is it showing a `no license specified` error for a crate you've created? If so, add `publish = false` under `[package]` in your crate's Cargo.toml.
-- Is the error `failed to satisfy license requirements` for a dependency? If so, first determine what license the project has and whether this system is sufficient to comply with this license's requirements. If you're unsure, ask a lawyer. Once you've verified that this system is acceptable add the license's SPDX identifier to the `accepted` array in `script/licenses/zed-licenses.toml`.
-- Is `cargo-about` unable to find the license for a dependency? If so, add a clarification field at the end of `script/licenses/zed-licenses.toml`, as specified in the [cargo-about book](https://embarkstudios.github.io/cargo-about/cli/generate/config.html#crate-configuration).
-
-## Sponsorship
-
-Zed is developed by **Zed Industries, Inc.**, a for-profit company.
-
-If you’d like to financially support the project, you can do so via GitHub Sponsors.
-Sponsorships go directly to Zed Industries and are used as general company revenue.
-There are no perks or entitlements associated with sponsorship.
+- [Zed repository](https://github.com/zed-industries/zed)
+- [macOS build guide](docs/src/development/macos.md)
+- [Linux build guide](docs/src/development/linux.md)
+- [Windows build guide](docs/src/development/windows.md)
+- [Contributing](CONTRIBUTING.md)

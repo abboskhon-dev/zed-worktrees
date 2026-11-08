@@ -1361,6 +1361,12 @@ pub struct PreviousWorkspaceState {
     pub focused_dock: Option<DockPosition>,
 }
 
+#[derive(Clone)]
+pub struct WorkspaceLayout {
+    docks: DockStructure,
+    panel_sizes: [Vec<(&'static str, dock::PanelSizeState)>; 3],
+}
+
 pub struct WorkspaceStore {
     workspaces: HashSet<(gpui::AnyWindowHandle, WeakEntity<Workspace>)>,
     client: Arc<Client>,
@@ -1579,6 +1585,7 @@ struct DispatchingKeystrokes {
 /// that can be used to register a global action to be triggered from any place in the window.
 pub struct Workspace {
     weak_self: WeakEntity<Self>,
+    restored_from_saved_state: bool,
     workspace_actions: Vec<Box<dyn Fn(Div, &Workspace, &mut Window, &mut Context<Self>) -> Div>>,
     zoomed: Option<AnyWeakView>,
     previous_dock_drag_coordinates: Option<Point<Pixels>>,
@@ -2088,6 +2095,7 @@ impl Workspace {
 
         Workspace {
             weak_self: weak_handle.clone(),
+            restored_from_saved_state: false,
             zoomed: None,
             zoomed_position: None,
             maximized_pane: None,
@@ -2192,6 +2200,7 @@ impl Workspace {
             }
 
             let serialized_workspace = db.workspace_for_roots(paths_to_open.as_slice());
+            let restored_from_saved_state = serialized_workspace.is_some();
 
             if let Some(paths) = serialized_workspace.as_ref().map(|ws| &ws.paths) {
                 paths_to_open = paths.ordered_paths().cloned().collect();
@@ -2281,6 +2290,7 @@ impl Workspace {
                             );
 
                             workspace.centered_layout = centered_layout;
+                            workspace.restored_from_saved_state = restored_from_saved_state;
 
                             // Call init callback to add items before window renders
                             if let Some(init) = init {
@@ -2344,6 +2354,7 @@ impl Workspace {
                                     cx,
                                 );
                                 workspace.centered_layout = centered_layout;
+                                workspace.restored_from_saved_state = restored_from_saved_state;
 
                                 // Call init callback to add items before window renders
                                 if let Some(init) = init {
@@ -2480,6 +2491,35 @@ impl Workspace {
 
     pub fn all_docks(&self) -> [&Entity<Dock>; 3] {
         [&self.left_dock, &self.bottom_dock, &self.right_dock]
+    }
+
+    pub fn restored_from_saved_state(&self) -> bool {
+        self.restored_from_saved_state
+    }
+
+    pub fn capture_layout(&self, window: &Window, cx: &App) -> WorkspaceLayout {
+        WorkspaceLayout {
+            docks: self.capture_dock_state(window, cx),
+            panel_sizes: self
+                .all_docks()
+                .map(|dock| dock.read(cx).capture_panel_sizes()),
+        }
+    }
+
+    pub fn apply_layout(
+        &mut self,
+        layout: WorkspaceLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for (dock, sizes) in self.all_docks().into_iter().zip(layout.panel_sizes) {
+            dock.update(cx, |dock, cx| dock.restore_panel_sizes(&sizes, cx));
+            for (key, state) in sizes {
+                self.persist_panel_size_state(key, state, cx);
+            }
+        }
+        self.set_dock_structure(layout.docks, window, cx);
+        self.serialize_workspace(window, cx);
     }
 
     pub fn capture_dock_state(&self, _window: &Window, cx: &App) -> DockStructure {

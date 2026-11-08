@@ -10,6 +10,7 @@ use gpui::{
 use project::git_store::{GitStoreEvent, RepositoryEvent};
 use serde::{Deserialize, Serialize};
 use settings::{GitDiffBaseSetting, SidebarSide};
+use terminal::{Event as TerminalEvent, TaskStatus, Terminal};
 use ui::{CommonAnimationExt, ContextMenu, ListItem, Tooltip, prelude::*, right_click_menu};
 use util::{ResultExt, path_list::PathList};
 use workspace::{
@@ -98,6 +99,8 @@ pub struct WorktreeNavigator {
     open_tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
     repository_subscriptions: HashMap<gpui::EntityId, Subscription>,
+    terminal_subscriptions: HashMap<gpui::EntityId, Subscription>,
+    notified_paths: HashSet<PathBuf>,
 }
 
 impl WorktreeNavigator {
@@ -106,7 +109,19 @@ impl WorktreeNavigator {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let navigator = cx.entity().downgrade();
         let subscriptions = vec![
+            cx.observe_new(move |_: &mut Terminal, _, cx| {
+                let terminal = cx.entity();
+                let navigator = navigator.clone();
+                cx.defer(move |cx| {
+                    navigator
+                        .update(cx, |navigator, cx| {
+                            navigator.observe_new_terminal(terminal, cx);
+                        })
+                        .log_err();
+                });
+            }),
             cx.on_release(|this, _| {
                 for task in std::mem::take(&mut this.open_tasks) {
                     task.detach();
@@ -116,7 +131,10 @@ impl WorktreeNavigator {
                 &multi_workspace,
                 window,
                 |this, _, event, window, cx| match event {
-                    MultiWorkspaceEvent::ActiveWorkspaceChanged { .. } => cx.notify(),
+                    MultiWorkspaceEvent::ActiveWorkspaceChanged { .. } => {
+                        this.acknowledge_active_workspace(cx);
+                        cx.notify();
+                    }
                     MultiWorkspaceEvent::WorkspaceAdded(_)
                     | MultiWorkspaceEvent::WorkspaceRemoved(_)
                     | MultiWorkspaceEvent::ProjectGroupsChanged => this.refresh(window, cx),
@@ -147,10 +165,13 @@ impl WorktreeNavigator {
             open_tasks: Vec::new(),
             _subscriptions: subscriptions,
             repository_subscriptions: HashMap::default(),
+            terminal_subscriptions: HashMap::default(),
+            notified_paths: HashSet::default(),
         }
     }
 
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_terminal_subscriptions(cx);
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
         };
@@ -240,6 +261,139 @@ impl WorktreeNavigator {
             self.projects = projects;
             cx.notify();
         }
+    }
+
+    fn observe_terminal(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        terminal: Entity<Terminal>,
+        cx: &mut Context<Self>,
+    ) {
+        let id = terminal.entity_id();
+        if self.terminal_subscriptions.contains_key(&id) {
+            return;
+        }
+        let workspace = workspace.downgrade();
+        let mut previous_status = terminal.read(cx).task().map(|task| task.status);
+        let subscription = cx.subscribe(&terminal, move |this, terminal, event, cx| {
+            let notify = match event {
+                TerminalEvent::Bell => true,
+                TerminalEvent::Wakeup => {
+                    let status = terminal.read(cx).task().map(|task| task.status);
+                    let completed = status != previous_status
+                        && matches!(status, Some(TaskStatus::Completed { .. }));
+                    previous_status = status;
+                    completed
+                }
+                _ => false,
+            };
+            if !notify {
+                return;
+            }
+            if let Some(workspace) = workspace.upgrade() {
+                let roots = workspace.read(cx).root_paths(cx);
+                let cwd = terminal.read(cx).working_directory();
+                let root = cwd
+                    .as_ref()
+                    .and_then(|cwd| {
+                        roots
+                            .iter()
+                            .filter(|root| cwd.starts_with(root.as_ref()))
+                            .max_by_key(|root| root.components().count())
+                    })
+                    .or_else(|| roots.first());
+                if let Some(root) = root
+                    && this.notified_paths.insert(root.to_path_buf())
+                {
+                    cx.notify();
+                }
+            }
+        });
+        self.terminal_subscriptions.insert(id, subscription);
+    }
+
+    fn observe_new_terminal(&mut self, terminal: Entity<Terminal>, cx: &mut Context<Self>) {
+        let workspace = self.multi_workspace.upgrade().and_then(|multi_workspace| {
+            multi_workspace
+                .read(cx)
+                .workspaces()
+                .find(|workspace| {
+                    workspace
+                        .read(cx)
+                        .project()
+                        .read(cx)
+                        .local_terminal_handles()
+                        .iter()
+                        .any(|handle| handle.entity_id() == terminal.entity_id())
+                })
+                .cloned()
+        });
+        if let Some(workspace) = workspace {
+            self.observe_terminal(&workspace, terminal, cx);
+        }
+    }
+
+    fn sync_terminal_subscriptions(&mut self, cx: &mut Context<Self>) {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let workspaces: Vec<_> = multi_workspace.read(cx).workspaces().cloned().collect();
+        let mut retained = HashSet::default();
+        for workspace in workspaces {
+            let terminals: Vec<_> = workspace
+                .read(cx)
+                .project()
+                .read(cx)
+                .local_terminal_handles()
+                .iter()
+                .filter_map(WeakEntity::upgrade)
+                .collect();
+            for terminal in terminals {
+                retained.insert(terminal.entity_id());
+                self.observe_terminal(&workspace, terminal, cx);
+            }
+        }
+        self.terminal_subscriptions
+            .retain(|id, _| retained.contains(id));
+    }
+
+    fn acknowledge_active_workspace(&mut self, cx: &App) {
+        if let Some(multi_workspace) = self.multi_workspace.upgrade() {
+            let roots = multi_workspace.read(cx).workspace().read(cx).root_paths(cx);
+            self.notified_paths
+                .retain(|path| !roots.iter().any(|root| root.as_ref() == path));
+        }
+    }
+
+    fn layout_source(&self, path: &Path, cx: &App) -> Option<Entity<Workspace>> {
+        let multi_workspace = self.multi_workspace.upgrade()?;
+        let multi_workspace = multi_workspace.read(cx);
+        let project = self.projects.iter().find(|project| {
+            project
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.path == path)
+        });
+        if let Some(project) = project {
+            if let Some(main) = project.worktrees.iter().find(|worktree| worktree.is_main)
+                && let Some(workspace) = multi_workspace.workspaces().find(|workspace| {
+                    workspace
+                        .read(cx)
+                        .root_paths(cx)
+                        .iter()
+                        .any(|root| root.as_ref() == main.path)
+                })
+            {
+                return Some(workspace.clone());
+            }
+            if let Some(workspace) = multi_workspace
+                .workspaces()
+                .find(|workspace| workspace.read(cx).project_group_key(cx) == project.key)
+            {
+                return Some(workspace.clone());
+            }
+        }
+        Some(multi_workspace.workspace().clone())
     }
 
     fn refresh_from_git(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -334,6 +488,7 @@ impl WorktreeNavigator {
     }
 
     fn remove_worktree_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.notified_paths.remove(&path);
         self.pinned_worktrees.retain(|pinned| pinned != &path);
         self.hidden_worktrees.insert(path);
         self.state_changed(cx);
@@ -493,6 +648,7 @@ impl WorktreeNavigator {
                     this.deleting_paths.remove(&path);
                     match result {
                         Ok(true) => {
+                            this.notified_paths.remove(&path);
                             this.pinned_worktrees.retain(|pinned| pinned != &path);
                             this.hidden_worktrees.remove(&path);
                             for project in &mut this.projects {
@@ -547,6 +703,7 @@ impl WorktreeNavigator {
                         .any(|root| root.as_ref() == path.as_path())
             })
         {
+            self.notified_paths.remove(&path);
             cx.notify();
             return;
         }
@@ -570,7 +727,10 @@ impl WorktreeNavigator {
             }
         };
         let app_state = source.read(cx).app_state().clone();
-        let dock_state = source.read(cx).capture_dock_state(window, cx);
+        let layout_source = self
+            .layout_source(&path, cx)
+            .unwrap_or_else(|| source.clone());
+        let layout = layout_source.read(cx).capture_layout(window, cx);
         let window_handle = window.window_handle().downcast::<MultiWorkspace>();
         self.open_tasks
             .push(cx.spawn_in(window, async move |this, cx| {
@@ -591,29 +751,36 @@ impl WorktreeNavigator {
                             cx,
                         )
                     })?;
-                    let workspace = if let Some(existing) = existing {
-                        existing
+                    let (workspace, apply_layout) = if let Some(existing) = existing {
+                        (existing, false)
                     } else {
-                        cx.update(|_, cx| {
-                            Workspace::new_local(
-                                vec![canonical],
-                                app_state,
-                                window_handle,
-                                None,
-                                Some(Box::new(move |workspace, window, cx| {
-                                    workspace.set_dock_structure(dock_state, window, cx);
-                                })),
-                                OpenMode::Add,
-                                cx,
-                            )
-                        })?
-                        .await?
-                        .workspace
+                        let workspace = cx
+                            .update(|_, cx| {
+                                Workspace::new_local(
+                                    vec![canonical],
+                                    app_state,
+                                    window_handle,
+                                    None,
+                                    None,
+                                    OpenMode::Add,
+                                    cx,
+                                )
+                            })?
+                            .await?
+                            .workspace;
+                        let apply_layout = !workspace
+                            .read_with(cx, |workspace, _| workspace.restored_from_saved_state());
+                        (workspace, apply_layout)
                     };
                     if let Some(panels) =
                         workspace.update(cx, |workspace, _| workspace.take_panels_task())
                     {
                         panels.await?;
+                    }
+                    if apply_layout {
+                        workspace.update_in(cx, |workspace, window, cx| {
+                            workspace.apply_layout(layout, window, cx)
+                        })?;
                     }
                     Ok(workspace)
                 }
@@ -795,7 +962,7 @@ impl Sidebar for WorktreeNavigator {
         cx.notify();
     }
     fn has_notifications(&self, _: &App) -> bool {
-        false
+        !self.notified_paths.is_empty()
     }
     fn side(&self, _: &App) -> SidebarSide {
         SidebarSide::Right
@@ -895,10 +1062,18 @@ impl Render for WorktreeNavigator {
                 let loading =
                     self.loading_paths.contains(&path) || self.deleting_paths.contains(&path);
                 let pinned = self.pinned_worktrees.contains(&path);
+                let notified = self.notified_paths.contains(&path);
                 let pin_path = path.clone();
                 let delete_path = path.clone();
                 let menu_path = path.clone();
-                let tooltip = path.display().to_string();
+                let tooltip = if notified {
+                    format!(
+                        "{}\nTerminal notification: an agent rang the bell or a task finished.",
+                        path.display()
+                    )
+                } else {
+                    path.display().to_string()
+                };
                 let item = ListItem::new(SharedString::from(format!(
                     "navigator-worktree-{index}-{row}"
                 )))
@@ -916,7 +1091,20 @@ impl Render for WorktreeNavigator {
                         Color::Muted
                     }),
                 )
-                .child(Label::new(label).truncate())
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(div().flex_1().min_w_0().child(Label::new(label).truncate()))
+                        .when(notified, |row| {
+                            row.child(
+                                Icon::new(IconName::Bell)
+                                    .size(IconSize::Small)
+                                    .color(Color::Warning),
+                            )
+                        }),
+                )
                 .end_slot(
                     h_flex()
                         .w(px(48.))
@@ -1126,6 +1314,244 @@ mod tests {
     use settings::{Settings, SettingsStore};
     use std::{path::Path, sync::Arc};
     use util::path;
+
+    #[gpui::test]
+    async fn new_worktree_uses_its_main_workspace_layout_source(cx: &mut TestAppContext) {
+        let (_fs, multi_workspace, navigator, workspace_a, workspace_b, mut cx) = setup(cx).await;
+        let (_repository, path) = create_linked_worktree(&workspace_a, &mut cx).await;
+        multi_workspace.read_with(&cx, |workspace, _| {
+            assert_eq!(workspace.workspace(), &workspace_b)
+        });
+        navigator.read_with(&cx, |navigator, cx| {
+            assert_eq!(navigator.layout_source(&path, cx), Some(workspace_a))
+        });
+    }
+
+    #[gpui::test]
+    async fn reopened_saved_worktree_keeps_its_own_panel_dimensions(cx: &mut TestAppContext) {
+        use workspace::dock::{DockPosition, PanelSizeState, test::TestPanel};
+        let (_fs, multi_workspace, navigator, workspace_a, _workspace_b, mut cx) = setup(cx).await;
+        workspace_a.update_in(&mut cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.set_panel_size_state::<TestPanel>(
+                PanelSizeState {
+                    size: Some(px(200.)),
+                    flex: None,
+                },
+                window,
+                cx,
+            );
+        });
+        let repository = workspace_a
+            .read_with(&cx, |workspace, cx| {
+                workspace.project().read(cx).active_repository(cx)
+            })
+            .unwrap();
+        let path = PathBuf::from(format!(
+            "{}-{}",
+            path!("/saved-layout"),
+            rand::random::<u64>()
+        ));
+        repository
+            .update(&mut cx, |repository, _| {
+                repository.create_worktree(
+                    git::repository::CreateWorktreeTarget::NewBranch {
+                        branch_name: "saved-layout".into(),
+                        base_sha: None,
+                    },
+                    path.clone(),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        navigator.update_in(&mut cx, |navigator, window, cx| {
+            navigator.select_path(path.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        let loaded = multi_workspace.read_with(&cx, |workspace, _| workspace.workspace().clone());
+        loaded.read_with(&cx, |workspace, _| {
+            assert!(!workspace.restored_from_saved_state())
+        });
+        loaded
+            .update_in(&mut cx, |workspace, window, cx| {
+                let panel = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+                workspace.add_panel(panel, window, cx);
+                workspace.set_panel_size_state::<TestPanel>(
+                    PanelSizeState {
+                        size: Some(px(425.)),
+                        flex: None,
+                    },
+                    window,
+                    cx,
+                );
+                workspace.flush_serialization(window, cx)
+            })
+            .await;
+        cx.run_until_parked();
+        multi_workspace
+            .update_in(&mut cx, |workspace, window, cx| {
+                workspace.remove([loaded], RemovalIntent::CloseProject, window, cx)
+            })
+            .await
+            .unwrap();
+        navigator.update_in(&mut cx, |navigator, window, cx| {
+            navigator.select_path(path.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        let reopened = multi_workspace.read_with(&cx, |workspace, _| workspace.workspace().clone());
+        reopened.update_in(&mut cx, |workspace, window, cx| {
+            assert!(workspace.restored_from_saved_state());
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            assert_eq!(
+                workspace.panel_size_state::<TestPanel>(cx).unwrap().size,
+                Some(px(425.))
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn inherited_layout_copies_panel_dimensions_and_visibility(cx: &mut TestAppContext) {
+        use workspace::dock::{DockPosition, PanelSizeState, test::TestPanel};
+        let (_fs, _multi_workspace, _navigator, source, target, mut cx) = setup(cx).await;
+        for workspace in [&source, &target] {
+            workspace.update_in(&mut cx, |workspace, window, cx| {
+                let panel = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+                workspace.add_panel(panel, window, cx);
+            });
+        }
+        source.update_in(&mut cx, |workspace, window, cx| {
+            workspace.set_panel_size_state::<TestPanel>(
+                PanelSizeState {
+                    size: Some(px(425.)),
+                    flex: Some(0.35),
+                },
+                window,
+                cx,
+            );
+            workspace.open_panel::<TestPanel>(window, cx);
+        });
+        let layout = source.update_in(&mut cx, |workspace, window, cx| {
+            workspace.capture_layout(window, cx)
+        });
+        target.update_in(&mut cx, |workspace, window, cx| {
+            workspace.apply_layout(layout, window, cx)
+        });
+        target.read_with(&cx, |workspace, cx| {
+            assert_eq!(
+                workspace.panel_size_state::<TestPanel>(cx),
+                Some(PanelSizeState {
+                    size: Some(px(425.)),
+                    flex: Some(0.35)
+                })
+            );
+            assert!(workspace.bottom_dock().read(cx).is_open());
+        });
+        source.update_in(&mut cx, |workspace, window, cx| {
+            workspace.set_panel_size_state::<TestPanel>(
+                PanelSizeState {
+                    size: Some(px(200.)),
+                    flex: None,
+                },
+                window,
+                cx,
+            );
+        });
+        target.read_with(&cx, |workspace, cx| {
+            assert_eq!(
+                workspace.panel_size_state::<TestPanel>(cx).unwrap().size,
+                Some(px(425.))
+            )
+        });
+    }
+
+    #[gpui::test]
+    async fn terminal_bell_marks_its_worktree_until_visited(cx: &mut TestAppContext) {
+        let (_fs, multi_workspace, navigator, workspace_a, workspace_b, mut cx) = setup(cx).await;
+        let terminal = cx.update(|_, cx| {
+            let builder = terminal::TerminalBuilder::new_display_only(
+                terminal::terminal_settings::CursorShape::default(),
+                terminal::terminal_settings::AlternateScroll::On,
+                Some(100),
+                0,
+                cx.background_executor(),
+                util::paths::PathStyle::local(),
+            );
+            cx.new(|cx| builder.subscribe(cx))
+        });
+        navigator.update(&mut cx, |navigator, cx| {
+            navigator.observe_terminal(&workspace_a, terminal.clone(), cx)
+        });
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_raw_output(b"\x07", cx)
+        });
+        cx.run_until_parked();
+        navigator.read_with(&cx, |navigator, cx| {
+            assert!(
+                navigator
+                    .notified_paths
+                    .contains(Path::new(path!("/project-a")))
+            );
+            assert!(
+                !navigator
+                    .notified_paths
+                    .contains(Path::new(path!("/project-b")))
+            );
+            assert!(navigator.has_notifications(cx));
+        });
+        multi_workspace.read_with(&cx, |multi_workspace, _| {
+            assert_eq!(multi_workspace.workspace(), &workspace_b)
+        });
+        navigator.update_in(&mut cx, |navigator, window, cx| {
+            navigator.select_path(path!("/project-a").into(), window, cx)
+        });
+        cx.run_until_parked();
+        navigator.read_with(&cx, |navigator, cx| {
+            assert!(!navigator.has_notifications(cx))
+        });
+    }
+
+    #[gpui::test]
+    async fn ordinary_terminal_output_does_not_notify_or_redraw_navigator(cx: &mut TestAppContext) {
+        let (_fs, _multi_workspace, navigator, workspace_a, _workspace_b, mut cx) = setup(cx).await;
+        let terminal = cx.update(|_, cx| {
+            let builder = terminal::TerminalBuilder::new_display_only(
+                terminal::terminal_settings::CursorShape::default(),
+                terminal::terminal_settings::AlternateScroll::On,
+                Some(100),
+                0,
+                cx.background_executor(),
+                util::paths::PathStyle::local(),
+            );
+            cx.new(|cx| builder.subscribe(cx))
+        });
+        navigator.update(&mut cx, |navigator, cx| {
+            navigator.observe_terminal(&workspace_a, terminal.clone(), cx)
+        });
+        cx.run_until_parked();
+        let changes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _subscription = cx.update(|_, cx| {
+            cx.observe(&navigator, {
+                let changes = changes.clone();
+                move |_, _| changes.set(changes.get() + 1)
+            })
+        });
+        for _ in 0..10 {
+            terminal.update(&mut cx, |terminal, cx| {
+                terminal.write_output(b"working...\n", cx)
+            });
+            cx.run_until_parked();
+        }
+        assert_eq!(changes.get(), 0);
+        navigator.read_with(&cx, |navigator, cx| {
+            assert!(!navigator.has_notifications(cx))
+        });
+    }
 
     #[gpui::test]
     async fn restored_multi_folder_layouts_do_not_repeat_repository_entries(
