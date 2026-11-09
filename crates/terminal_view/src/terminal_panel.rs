@@ -3165,6 +3165,75 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_terminal_sidebar_label_tracks_foreground_job_and_return_to_shell(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+        let (window_handle, panel) = init_workspace_with_panel(cx).await;
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let terminal = panel
+            .update_in(cx, |panel, window, cx| {
+                panel.add_terminal_shell(false, None, RevealStrategy::Always, window, cx)
+            })
+            .await
+            .expect("shell starts")
+            .upgrade()
+            .expect("live shell");
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if terminal.read_with(cx, |terminal, _| terminal.title(false).contains(" — ")) {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(25))
+                .await;
+        }
+        let shell = panel.read_with(cx, |panel, cx| {
+            panel
+                .active_pane
+                .read(cx)
+                .active_item()
+                .expect("terminal item")
+                .tab_content_text(0, cx)
+                .to_string()
+        });
+        let title = async |cx: &mut VisualTestContext, expected: &str| {
+            let mut title = String::new();
+            for _ in 0..200 {
+                cx.run_until_parked();
+                title = panel.read_with(cx, |panel, cx| {
+                    panel
+                        .active_pane
+                        .read(cx)
+                        .active_item()
+                        .expect("terminal item")
+                        .tab_content_text(0, cx)
+                        .to_string()
+                });
+                if title == expected {
+                    return;
+                }
+                cx.background_executor
+                    .timer(Duration::from_millis(25))
+                    .await;
+            }
+            panic!("expected {expected}, got {title}");
+        };
+        for (command, expected) in [
+            ("/bin/sleep 30\r", "sleep"),
+            ("/bin/zsh -f -c 'exec -a codex /bin/sleep 30'\r", "codex"),
+        ] {
+            terminal.update(cx, |terminal, _| {
+                terminal.input(command.as_bytes().to_vec())
+            });
+            title(cx, expected).await;
+            terminal.update(cx, |terminal, _| terminal.input(vec![3]));
+            title(cx, &shell).await;
+        }
+    }
+
+    #[gpui::test]
     async fn test_terminal_sidebar_resizes_by_dragging_divider(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         init_test(cx);

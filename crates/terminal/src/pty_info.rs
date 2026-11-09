@@ -1,6 +1,13 @@
 use gpui::{Context, Task};
 use parking_lot::{MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 #[cfg(target_os = "windows")]
 use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
@@ -8,6 +15,7 @@ use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::{Event, Terminal};
+use util::ResultExt;
 
 #[derive(Clone, Copy)]
 pub struct ProcessIdGetter {
@@ -80,6 +88,7 @@ pub(crate) struct PtyProcessInfo {
     last_foreground_pid: Mutex<Option<Pid>>,
     pub(crate) current: RwLock<Option<ProcessInfo>>,
     task: Mutex<Option<Task<()>>>,
+    refresh_requested: AtomicBool,
 }
 
 impl PtyProcessInfo {
@@ -111,6 +120,7 @@ impl PtyProcessInfo {
             last_foreground_pid: Mutex::new(None),
             current: RwLock::new(None),
             task: Mutex::new(None),
+            refresh_requested: AtomicBool::new(false),
         }
     }
 
@@ -198,16 +208,24 @@ impl PtyProcessInfo {
 
     /// Updates the cached process info, emitting a [`Event::TitleChanged`] event if the Zed-relevant info has changed
     pub(crate) fn emit_title_changed_if_changed(self: &Arc<Self>, cx: &mut Context<'_, Terminal>) {
+        self.refresh_requested.store(true, Ordering::Relaxed);
         if self.task.lock().is_some() {
             return;
         }
         let this = self.clone();
+        // Shell echo can arrive before the foreground job starts. Coalesce output
+        // before inspecting the PTY, and avoid a process scan for every frame.
+        let delay = cx.background_executor().timer(Duration::from_millis(250));
         let change_task = cx.background_executor().spawn(async move {
+            delay.await;
+            this.refresh_requested.store(false, Ordering::Relaxed);
             let previous = this.current.read().clone();
             let current = this.load();
             let has_changed = match (previous.as_ref(), current.as_ref()) {
                 (None, None) => false,
-                (Some(prev), Some(now)) => prev.cwd != now.cwd || prev.name != now.name,
+                (Some(prev), Some(now)) => {
+                    prev.cwd != now.cwd || prev.name != now.name || prev.argv != now.argv
+                }
                 _ => true,
             };
             if has_changed {
@@ -234,6 +252,10 @@ impl PtyProcessInfo {
             }
             if let Some(this) = this.upgrade() {
                 this.task.lock().take();
+                if this.refresh_requested.swap(false, Ordering::Relaxed) {
+                    term.update(cx, |_, cx| this.emit_title_changed_if_changed(cx))
+                        .log_err();
+                }
             }
         }));
     }
