@@ -70,6 +70,7 @@ impl ProjectEntry {
 struct SerializedNavigator {
     width: Option<f32>,
     pinned_worktrees: Vec<PathBuf>,
+    worktree_order: Vec<PathBuf>,
     hidden_worktrees: BTreeSet<PathBuf>,
     hidden_projects: BTreeSet<NavigatorProjectId>,
     collapsed_projects: BTreeSet<NavigatorProjectId>,
@@ -79,6 +80,28 @@ struct WorktreeRow {
     path: PathBuf,
     label: SharedString,
     can_delete: bool,
+}
+
+#[derive(Clone)]
+struct DraggedWorktree {
+    navigator_id: gpui::EntityId,
+    project: NavigatorProjectId,
+    path: PathBuf,
+    label: SharedString,
+    index: usize,
+    pinned: bool,
+}
+
+impl Render for DraggedWorktree {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .bg(cx.theme().colors().panel_background)
+            .child(Icon::new(IconName::GitBranch))
+            .child(Label::new(self.label.clone()))
+    }
 }
 
 pub struct WorktreeNavigator {
@@ -91,6 +114,7 @@ pub struct WorktreeNavigator {
     loading_paths: HashSet<PathBuf>,
     deleting_paths: HashSet<PathBuf>,
     pinned_worktrees: Vec<PathBuf>,
+    worktree_order: Vec<PathBuf>,
     hidden_worktrees: BTreeSet<PathBuf>,
     hidden_projects: BTreeSet<NavigatorProjectId>,
     collapsed_projects: BTreeSet<NavigatorProjectId>,
@@ -157,6 +181,7 @@ impl WorktreeNavigator {
             loading_paths: HashSet::default(),
             deleting_paths: HashSet::default(),
             pinned_worktrees: Vec::new(),
+            worktree_order: Vec::new(),
             hidden_worktrees: BTreeSet::default(),
             hidden_projects: BTreeSet::default(),
             collapsed_projects: BTreeSet::default(),
@@ -487,6 +512,50 @@ impl WorktreeNavigator {
         self.state_changed(cx);
     }
 
+    fn reorder_worktree(
+        &mut self,
+        dragged: &DraggedWorktree,
+        target: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        if dragged.navigator_id != cx.entity().entity_id() || dragged.path == target {
+            return;
+        }
+        let Some(project) = self
+            .projects
+            .iter()
+            .find(|project| project.id() == dragged.project)
+        else {
+            return;
+        };
+        let pinned = self.pinned_worktrees.contains(&dragged.path);
+        if pinned != self.pinned_worktrees.iter().any(|path| path == target) {
+            return;
+        }
+        let mut paths: Vec<_> = self
+            .worktree_rows(project)
+            .into_iter()
+            .filter(|row| self.pinned_worktrees.contains(&row.path) == pinned)
+            .map(|row| row.path)
+            .collect();
+        let Some(from) = paths.iter().position(|path| path == &dragged.path) else {
+            return;
+        };
+        let Some(to) = paths.iter().position(|path| path == target) else {
+            return;
+        };
+        let path = paths.remove(from);
+        paths.insert(to, path);
+        let order = if pinned {
+            &mut self.pinned_worktrees
+        } else {
+            &mut self.worktree_order
+        };
+        order.retain(|path| !paths.contains(path));
+        order.extend(paths);
+        self.state_changed(cx);
+    }
+
     fn remove_worktree_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.notified_paths.remove(&path);
         self.pinned_worktrees.retain(|pinned| pinned != &path);
@@ -543,10 +612,20 @@ impl WorktreeNavigator {
         };
         rows.retain(|row| !self.hidden_worktrees.contains(&row.path));
         rows.sort_by_key(|row| {
-            self.pinned_worktrees
+            match self
+                .pinned_worktrees
                 .iter()
                 .position(|path| path == &row.path)
-                .unwrap_or(usize::MAX)
+            {
+                Some(index) => (false, index),
+                None => (
+                    true,
+                    self.worktree_order
+                        .iter()
+                        .position(|path| path == &row.path)
+                        .unwrap_or(usize::MAX),
+                ),
+            }
         });
         rows
     }
@@ -974,6 +1053,7 @@ impl Sidebar for WorktreeNavigator {
         serde_json::to_string(&SerializedNavigator {
             width: Some(self.width.into()),
             pinned_worktrees: self.pinned_worktrees.clone(),
+            worktree_order: self.worktree_order.clone(),
             hidden_worktrees: self.hidden_worktrees.clone(),
             hidden_projects: self.hidden_projects.clone(),
             collapsed_projects: self.collapsed_projects.clone(),
@@ -983,6 +1063,7 @@ impl Sidebar for WorktreeNavigator {
     fn restore_serialized_state(&mut self, state: &str, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(state) = serde_json::from_str::<SerializedNavigator>(state).log_err() {
             self.pinned_worktrees = state.pinned_worktrees;
+            self.worktree_order = state.worktree_order;
             self.hidden_worktrees = state.hidden_worktrees;
             self.hidden_projects = state.hidden_projects;
             self.collapsed_projects = state.collapsed_projects;
@@ -1066,6 +1147,17 @@ impl Render for WorktreeNavigator {
                 let pin_path = path.clone();
                 let delete_path = path.clone();
                 let menu_path = path.clone();
+                let dragged = DraggedWorktree {
+                    navigator_id: cx.entity().entity_id(),
+                    project: project.id(),
+                    path: path.clone(),
+                    label: label.clone(),
+                    index: row,
+                    pinned,
+                };
+                let drop_path = path.clone();
+                let drop_project = project.id();
+                let navigator_id = cx.entity().entity_id();
                 let tooltip = if notified {
                     format!(
                         "{}\nTerminal notification: an agent rang the bell or a task finished.",
@@ -1168,49 +1260,93 @@ impl Render for WorktreeNavigator {
                 }));
                 let navigator = cx.entity().downgrade();
                 rows.push(
-                    right_click_menu(SharedString::from(format!(
-                        "navigator-row-menu-{index}-{row}"
-                    )))
-                    .trigger(move |_, _, _| item)
-                    .menu(move |window, cx| {
-                        let navigator = navigator.clone();
-                        let path = menu_path.clone();
-                        ContextMenu::build(window, cx, move |menu, window, _| {
-                            let Some(navigator) = navigator.upgrade() else {
-                                return menu;
-                            };
-                            let pin_path = path.clone();
-                            let remove_path = path.clone();
-                            menu.entry(
-                                if pinned {
-                                    "Unpin worktree"
-                                } else {
-                                    "Pin worktree"
-                                },
-                                None,
-                                window.handler_for(&navigator, move |this, _, cx| {
-                                    this.toggle_pin(pin_path.clone(), cx)
-                                }),
-                            )
-                            .entry(
-                                "Remove from sidebar",
-                                None,
-                                window.handler_for(&navigator, move |this, _, cx| {
-                                    this.remove_worktree_entry(remove_path.clone(), cx)
-                                }),
-                            )
-                            .when(can_delete && !loading, |menu| {
-                                menu.separator().entry(
-                                    "Delete worktree…",
-                                    None,
-                                    window.handler_for(&navigator, move |this, window, cx| {
-                                        this.delete_worktree(path.clone(), window, cx)
-                                    }),
-                                )
-                            })
+                    div()
+                        .id(SharedString::from(format!(
+                            "draggable-worktree-{index}-{row}"
+                        )))
+                        .debug_selector(move || format!("navigator-worktree-{index}-{row}"))
+                        .can_drop(move |dragged, _, _| {
+                            dragged
+                                .downcast_ref::<DraggedWorktree>()
+                                .is_some_and(|dragged| {
+                                    dragged.navigator_id == navigator_id
+                                        && dragged.project == drop_project
+                                        && dragged.pinned == pinned
+                                        && !loading
+                                })
                         })
-                    })
-                    .into_any_element(),
+                        .when(!loading, |item| {
+                            item.on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+                        })
+                        .drag_over::<DraggedWorktree>(move |item, dragged, _, cx| {
+                            let item = item
+                                .bg(cx.theme().colors().drop_target_background)
+                                .border_color(cx.theme().colors().drop_target_border);
+                            if dragged.index < row {
+                                item.border_b_2()
+                            } else {
+                                item.border_t_2()
+                            }
+                        })
+                        .on_drop(cx.listener(move |this, dragged: &DraggedWorktree, _, cx| {
+                            this.reorder_worktree(dragged, &drop_path, cx);
+                            cx.stop_propagation();
+                        }))
+                        .child(
+                            right_click_menu(SharedString::from(format!(
+                                "navigator-row-menu-{index}-{row}"
+                            )))
+                            .trigger(move |_, _, _| item)
+                            .menu(move |window, cx| {
+                                let navigator = navigator.clone();
+                                let path = menu_path.clone();
+                                ContextMenu::build(window, cx, move |menu, window, _| {
+                                    let Some(navigator) = navigator.upgrade() else {
+                                        return menu;
+                                    };
+                                    let pin_path = path.clone();
+                                    let remove_path = path.clone();
+                                    menu.entry(
+                                        if pinned {
+                                            "Unpin worktree"
+                                        } else {
+                                            "Pin worktree"
+                                        },
+                                        None,
+                                        window.handler_for(&navigator, move |this, _, cx| {
+                                            this.toggle_pin(pin_path.clone(), cx)
+                                        }),
+                                    )
+                                    .entry(
+                                        "Remove from sidebar",
+                                        None,
+                                        window.handler_for(&navigator, move |this, _, cx| {
+                                            this.remove_worktree_entry(remove_path.clone(), cx)
+                                        }),
+                                    )
+                                    .when(
+                                        can_delete && !loading,
+                                        |menu| {
+                                            menu.separator().entry(
+                                                "Delete worktree…",
+                                                None,
+                                                window.handler_for(
+                                                    &navigator,
+                                                    move |this, window, cx| {
+                                                        this.delete_worktree(
+                                                            path.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    },
+                                                ),
+                                            )
+                                        },
+                                    )
+                                })
+                            }),
+                        )
+                        .into_any_element(),
                 );
             }
             if let Some(error) = &project.error {
@@ -1645,6 +1781,99 @@ mod tests {
             .advance_clock(std::time::Duration::from_secs(1));
         cx.run_until_parked();
         (repository, path)
+    }
+
+    #[gpui::test]
+    async fn dragged_worktree_order_survives_refresh_and_restoration(cx: &mut TestAppContext) {
+        let (_fs, multi_workspace, navigator, workspace_a, _workspace_b, mut cx) = setup(cx).await;
+        let (_repository, linked) = create_linked_worktree(&workspace_a, &mut cx).await;
+        let main = PathBuf::from(path!("/project-a"));
+        let project_index = navigator.read_with(&cx, |navigator, _| {
+            navigator
+                .projects
+                .iter()
+                .position(|project| {
+                    project
+                        .worktrees
+                        .iter()
+                        .any(|worktree| worktree.path == linked)
+                })
+                .unwrap()
+        });
+        let selectors = [
+            ["navigator-worktree-0-0", "navigator-worktree-0-1"],
+            ["navigator-worktree-1-0", "navigator-worktree-1-1"],
+        ];
+        for (from, to, expected) in [
+            (1, 0, vec![linked.clone(), main.clone()]),
+            (0, 1, vec![main.clone(), linked.clone()]),
+            (1, 0, vec![linked.clone(), main.clone()]),
+        ] {
+            let start = cx
+                .debug_bounds(selectors[project_index][from])
+                .expect("source row")
+                .center();
+            let end = cx
+                .debug_bounds(selectors[project_index][to])
+                .expect("target row")
+                .center();
+            cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+            cx.simulate_mouse_move(
+                start + gpui::point(px(0.), px(8.)),
+                Some(gpui::MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
+            cx.simulate_mouse_move(
+                end,
+                Some(gpui::MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
+            cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
+            cx.run_until_parked();
+            navigator.read_with(&cx, |navigator, _| {
+                assert_eq!(
+                    navigator
+                        .worktree_rows(&navigator.projects[project_index])
+                        .into_iter()
+                        .map(|row| row.path)
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+            });
+        }
+        navigator.update_in(&mut cx, |navigator, window, cx| {
+            navigator.refresh(window, cx)
+        });
+        cx.run_until_parked();
+        let state =
+            navigator.read_with(&cx, |navigator, cx| navigator.serialized_state(cx).unwrap());
+        let restored = cx.update(|window, cx| {
+            cx.new(|cx| WorktreeNavigator::new(multi_workspace.clone(), window, cx))
+        });
+        restored.update_in(&mut cx, |navigator, window, cx| {
+            navigator.restore_serialized_state(&state, window, cx)
+        });
+        cx.run_until_parked();
+        restored.read_with(&cx, |navigator, _| {
+            let project = navigator
+                .projects
+                .iter()
+                .find(|project| {
+                    project
+                        .worktrees
+                        .iter()
+                        .any(|worktree| worktree.path == linked)
+                })
+                .unwrap();
+            assert_eq!(
+                navigator
+                    .worktree_rows(project)
+                    .into_iter()
+                    .map(|row| row.path)
+                    .collect::<Vec<_>>(),
+                vec![linked, main]
+            );
+        });
     }
 
     #[gpui::test]

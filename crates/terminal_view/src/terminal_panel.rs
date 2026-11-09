@@ -259,7 +259,7 @@ impl TerminalPanel {
         let mut tabs = Vec::new();
         for pane in self.center.panes() {
             let pane_state = pane.read(cx);
-            for item in pane_state.items() {
+            for (index, item) in pane_state.items().enumerate() {
                 let item_id = item.item_id();
                 let selected = *pane == self.active_pane
                     && pane_state
@@ -289,61 +289,103 @@ impl TerminalPanel {
                     item.tab_content(content_params, window, cx)
                 };
                 let tooltip = item.tab_tooltip_content(cx);
-                tabs.push(
-                    ListItem::new(("terminal-tab", item_id))
-                        .toggle_state(selected)
-                        .aria_role(gpui::Role::Tab)
-                        .aria_label(item.tab_content_text(0, cx))
-                        .child(div().flex_1().min_w_0().overflow_hidden().child(content))
-                        .when(has_bell, |tab| {
-                            tab.end_slot(Icon::new(IconName::Bell).color(Color::Warning))
-                        })
-                        .end_slot_on_hover(
-                            IconButton::new(("close-terminal-tab", item_id), IconName::Close)
-                                .icon_size(IconSize::Small)
-                                .tooltip(Tooltip::text("Close Terminal"))
-                                .on_click({
-                                    let pane = pane.clone();
-                                    move |_, window, cx| {
-                                        cx.stop_propagation();
-                                        pane.update(cx, |pane, cx| {
-                                            pane.close_item_by_id(
-                                                item_id,
-                                                SaveIntent::Close,
-                                                window,
-                                                cx,
-                                            )
-                                            .detach_and_log_err(cx);
-                                        });
-                                    }
-                                }),
-                        )
-                        .on_click(cx.listener({
-                            let pane = pane.clone();
-                            move |panel, event: &gpui::ClickEvent, window, cx| {
-                                panel.active_pane = pane.clone();
-                                cx.notify();
-                                pane.update(cx, |pane, cx| {
-                                    let index =
-                                        pane.items().position(|item| item.item_id() == item_id);
-                                    if let Some(index) = index {
-                                        pane.activate_item(index, true, true, window, cx);
-                                    }
-                                });
-                                if event.click_count() == 2
-                                    && let Some(view) = terminal_view.as_ref()
-                                {
-                                    view.update(cx, |view, cx| {
-                                        view.rename_terminal(&Default::default(), window, cx);
+                let tab = ListItem::new(("terminal-tab", item_id))
+                    .toggle_state(selected)
+                    .aria_role(gpui::Role::Tab)
+                    .aria_label(item.tab_content_text(0, cx))
+                    .child(div().flex_1().min_w_0().overflow_hidden().child(content))
+                    .when(has_bell, |tab| {
+                        tab.end_slot(Icon::new(IconName::Bell).color(Color::Warning))
+                    })
+                    .end_slot_on_hover(
+                        IconButton::new(("close-terminal-tab", item_id), IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Close Terminal"))
+                            .on_click({
+                                let pane = pane.clone();
+                                move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    pane.update(cx, |pane, cx| {
+                                        pane.close_item_by_id(
+                                            item_id,
+                                            SaveIntent::Close,
+                                            window,
+                                            cx,
+                                        )
+                                        .detach_and_log_err(cx);
                                     });
                                 }
+                            }),
+                    )
+                    .on_click(cx.listener({
+                        let pane = pane.clone();
+                        move |panel, event: &gpui::ClickEvent, window, cx| {
+                            panel.active_pane = pane.clone();
+                            cx.notify();
+                            pane.update(cx, |pane, cx| {
+                                let index = pane.items().position(|item| item.item_id() == item_id);
+                                if let Some(index) = index {
+                                    pane.activate_item(index, true, true, window, cx);
+                                }
+                            });
+                            if event.click_count() == 2
+                                && let Some(view) = terminal_view.as_ref()
+                            {
+                                view.update(cx, |view, cx| {
+                                    view.rename_terminal(&Default::default(), window, cx);
+                                });
                             }
+                        }
+                    }))
+                    .map(|tab| match tooltip {
+                        Some(TabTooltipContent::Text(text)) => tab.tooltip(Tooltip::text(text)),
+                        Some(TabTooltipContent::Custom(tooltip)) => tab.tooltip(tooltip),
+                        None => tab,
+                    });
+                let dragged_tab = DraggedTab {
+                    item: item.boxed_clone(),
+                    pane: pane.clone(),
+                    detail: 0,
+                    is_active: selected,
+                    ix: index,
+                };
+                let target_pane = pane.clone();
+                let panel = cx.entity().downgrade();
+                let same_pane = pane.clone();
+                tabs.push(
+                    div()
+                        .id(("draggable-terminal-tab", item_id))
+                        .on_drag(dragged_tab, |tab, _, _, cx| cx.new(|_| tab.clone()))
+                        .can_drop(move |dragged, _, cx| {
+                            dragged.downcast_ref::<DraggedTab>().is_some_and(|tab| {
+                                tab.item.downcast::<TerminalView>().is_some()
+                                    && panel
+                                        .read_with(cx, |panel, _| {
+                                            panel.center.panes().contains(&&tab.pane)
+                                        })
+                                        .unwrap_or(false)
+                            })
+                        })
+                        .drag_over::<DraggedTab>(move |row, tab, _, cx| {
+                            let row = row
+                                .bg(cx.theme().colors().drop_target_background)
+                                .border_color(cx.theme().colors().drop_target_border);
+                            if tab.pane == same_pane && tab.ix < index {
+                                row.border_b_2()
+                            } else {
+                                row.border_t_2()
+                            }
+                        })
+                        .on_drop(cx.listener(move |panel, tab: &DraggedTab, window, cx| {
+                            panel.active_pane = target_pane.clone();
+                            target_pane.update(cx, |pane, cx| {
+                                pane.drag_split_direction = None;
+                                pane.handle_tab_drop(tab, index, false, window, cx);
+                            });
+                            cx.stop_propagation();
+                            cx.notify();
                         }))
-                        .map(|tab| match tooltip {
-                            Some(TabTooltipContent::Text(text)) => tab.tooltip(Tooltip::text(text)),
-                            Some(TabTooltipContent::Custom(tooltip)) => tab.tooltip(tooltip),
-                            None => tab,
-                        }),
+                        .child(tab),
                 );
             }
         }
@@ -3160,6 +3202,79 @@ mod tests {
                 assert_eq!(panel.center.panes().len(), 2);
                 assert_eq!(original_pane.read(cx).items_len(), 1);
                 assert_eq!(new_pane.read(cx).items_len(), 1);
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn test_terminal_sidebar_reorders_running_sessions_by_dragging(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+        let (window_handle, panel) = init_workspace_with_panel(cx).await;
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        for _ in 0..3 {
+            panel
+                .update_in(cx, |panel, window, cx| {
+                    panel.add_terminal_shell(false, None, RevealStrategy::Always, window, cx)
+                })
+                .await
+                .expect("terminal should start");
+        }
+        cx.run_until_parked();
+        let original: Vec<_> = panel.read_with(cx, |panel, cx| {
+            panel
+                .active_pane
+                .read(cx)
+                .items()
+                .map(|item| item.item_id())
+                .collect()
+        });
+        for (from, to, expected) in [
+            (0, 2, vec![original[1], original[2], original[0]]),
+            (2, 0, original.clone()),
+        ] {
+            let (start, end) = panel.read_with(cx, |panel, _| {
+                (
+                    panel
+                        .terminal_tabs_scroll_handle
+                        .bounds_for_item(from)
+                        .expect("source row")
+                        .center(),
+                    panel
+                        .terminal_tabs_scroll_handle
+                        .bounds_for_item(to)
+                        .expect("target row")
+                        .center(),
+                )
+            });
+            cx.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::default());
+            cx.simulate_mouse_move(
+                start + gpui::point(px(0.), px(8.)),
+                Some(gpui::MouseButton::Left),
+                Modifiers::default(),
+            );
+            cx.simulate_mouse_move(end, Some(gpui::MouseButton::Left), Modifiers::default());
+            cx.simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::default());
+            cx.run_until_parked();
+            panel.read_with(cx, |panel, cx| {
+                let pane = panel.active_pane.read(cx);
+                assert_eq!(
+                    pane.items().map(|item| item.item_id()).collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(
+                    pane.active_item().expect("active terminal").item_id(),
+                    original[0]
+                );
+                assert!(pane.items().all(|item| {
+                    item.downcast::<TerminalView>()
+                        .expect("terminal view")
+                        .read(cx)
+                        .terminal()
+                        .read(cx)
+                        .pid()
+                        .is_some()
+                }));
             });
         }
     }
