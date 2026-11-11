@@ -321,6 +321,9 @@ impl TerminalPanel {
                         let pane = pane.clone();
                         move |panel, event: &gpui::ClickEvent, window, cx| {
                             panel.active_pane = pane.clone();
+                            if let Some(view) = terminal_view.as_ref() {
+                                view.update(cx, |view, cx| view.clear_bell(cx));
+                            }
                             cx.notify();
                             pane.update(cx, |pane, cx| {
                                 let index = pane.items().position(|item| item.item_id() == item_id);
@@ -3103,8 +3106,25 @@ mod tests {
             )
         });
         assert!(cx.debug_bounds("terminal-tabs").is_some());
+        let first_view = panel.read_with(cx, |panel, cx| {
+            panel
+                .active_pane
+                .read(cx)
+                .item_for_index(0)
+                .expect("first terminal")
+                .downcast::<TerminalView>()
+                .expect("terminal view")
+        });
+        let first_terminal = first_view.read_with(cx, |view, _| view.terminal().clone());
+        first_terminal.update(cx, |terminal, cx| terminal.write_raw_output(b"\x07", cx));
+        cx.run_until_parked();
+        assert!(first_view.read_with(cx, |view, _| view.has_bell()));
         cx.simulate_click(first_bounds.center(), Modifiers::default());
         cx.run_until_parked();
+        assert!(
+            !first_view.read_with(cx, |view, _| view.has_bell()),
+            "selecting a terminal row acknowledges its bell"
+        );
         panel.read_with(cx, |panel, cx| {
             assert_eq!(
                 panel

@@ -166,6 +166,9 @@ impl WorktreeNavigator {
             ),
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
+                    if this.acknowledge_active_workspace(cx) {
+                        cx.notify();
+                    }
                     this.refresh(window, cx);
                 }
             }),
@@ -327,10 +330,27 @@ impl WorktreeNavigator {
                             .max_by_key(|root| root.components().count())
                     })
                     .or_else(|| roots.first());
-                if let Some(root) = root
-                    && this.notified_paths.insert(root.to_path_buf())
-                {
-                    cx.notify();
+                if let Some(root) = root {
+                    let already_viewing =
+                        this.multi_workspace
+                            .upgrade()
+                            .is_some_and(|multi_workspace| {
+                                multi_workspace
+                                    .read(cx)
+                                    .workspace()
+                                    .read(cx)
+                                    .root_paths(cx)
+                                    .iter()
+                                    .any(|active_root| active_root.as_ref() == root.as_ref())
+                            });
+                    let changed = if already_viewing {
+                        this.notified_paths.remove(root.as_ref())
+                    } else {
+                        this.notified_paths.insert(root.to_path_buf())
+                    };
+                    if changed {
+                        cx.notify();
+                    }
                 }
             }
         });
@@ -382,12 +402,14 @@ impl WorktreeNavigator {
             .retain(|id, _| retained.contains(id));
     }
 
-    fn acknowledge_active_workspace(&mut self, cx: &App) {
+    fn acknowledge_active_workspace(&mut self, cx: &App) -> bool {
+        let previous_count = self.notified_paths.len();
         if let Some(multi_workspace) = self.multi_workspace.upgrade() {
             let roots = multi_workspace.read(cx).workspace().read(cx).root_paths(cx);
             self.notified_paths
                 .retain(|path| !roots.iter().any(|root| root.as_ref() == path));
         }
+        self.notified_paths.len() != previous_count
     }
 
     fn layout_source(&self, path: &Path, cx: &App) -> Option<Entity<Workspace>> {
@@ -1645,6 +1667,40 @@ mod tests {
         });
         navigator.update_in(&mut cx, |navigator, window, cx| {
             navigator.select_path(path!("/project-a").into(), window, cx)
+        });
+        cx.run_until_parked();
+        navigator.read_with(&cx, |navigator, cx| {
+            assert!(!navigator.has_notifications(cx))
+        });
+        // Refresh prunes this display-only fixture because the project does not own it.
+        navigator.update(&mut cx, |navigator, cx| {
+            navigator.observe_terminal(&workspace_a, terminal.clone(), cx)
+        });
+        terminal.update(&mut cx, |_, cx| cx.emit(TerminalEvent::Bell));
+        cx.run_until_parked();
+        navigator.read_with(&cx, |navigator, cx| {
+            assert!(
+                !navigator.has_notifications(cx),
+                "a notification while viewing the worktree is already read"
+            );
+        });
+        multi_workspace.update_in(&mut cx, |multi_workspace, window, cx| {
+            multi_workspace.activate(workspace_b.clone(), None, window, cx);
+        });
+        cx.run_until_parked();
+        multi_workspace.read_with(&cx, |multi_workspace, _| {
+            assert_eq!(multi_workspace.workspace(), &workspace_b)
+        });
+        navigator.update(&mut cx, |navigator, cx| {
+            navigator.observe_terminal(&workspace_a, terminal.clone(), cx)
+        });
+        terminal.update(&mut cx, |_, cx| cx.emit(TerminalEvent::Bell));
+        cx.run_until_parked();
+        navigator.read_with(&cx, |navigator, cx| {
+            assert!(navigator.has_notifications(cx))
+        });
+        multi_workspace.update_in(&mut cx, |multi_workspace, window, cx| {
+            multi_workspace.activate(workspace_a, None, window, cx);
         });
         cx.run_until_parked();
         navigator.read_with(&cx, |navigator, cx| {

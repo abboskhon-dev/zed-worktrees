@@ -165,7 +165,6 @@ pub struct TerminalView {
     workspace: WeakEntity<Workspace>,
     project: WeakEntity<Project>,
     focus_handle: FocusHandle,
-    //Currently using iTerm bell, show bell emoji in tab until input is received
     has_bell: bool,
     context_menu: Option<(Entity<ContextMenu>, GpuiPoint<Pixels>, Subscription)>,
     cursor_shape: CursorShape,
@@ -315,6 +314,11 @@ impl TerminalView {
         let subscriptions = vec![
             focus_in,
             focus_out,
+            cx.observe_window_activation(window, |view, window, cx| {
+                if window.is_window_active() && view.focus_handle.contains_focused(window, cx) {
+                    view.clear_bell(cx);
+                }
+            }),
             cx.observe(&blink_manager, |_, _, cx| cx.notify()),
             cx.observe_global::<SettingsStore>(Self::settings_changed),
         ];
@@ -612,8 +616,12 @@ impl TerminalView {
     }
 
     pub fn clear_bell(&mut self, cx: &mut Context<TerminalView>) {
-        self.has_bell = false;
-        cx.emit(Event::Wakeup);
+        if self.has_bell {
+            self.has_bell = false;
+            cx.emit(ItemEvent::UpdateTab);
+            cx.emit(Event::Wakeup);
+            cx.notify();
+        }
     }
 
     pub fn deploy_context_menu(
@@ -1288,10 +1296,13 @@ fn subscribe_for_terminal_events(
                 }
 
                 Event::Bell => {
-                    if !terminal_view.has_bell {
+                    let unread = !(window.is_window_active()
+                        && terminal_view.focus_handle.contains_focused(window, cx));
+                    if terminal_view.has_bell != unread {
+                        terminal_view.has_bell = unread;
                         cx.emit(ItemEvent::UpdateTab);
+                        cx.notify();
                     }
-                    terminal_view.has_bell = true;
                     if let TerminalBell::System = TerminalSettings::get_global(cx).bell {
                         window.play_system_bell();
                     }
@@ -1456,6 +1467,7 @@ impl TerminalView {
     }
 
     fn focus_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_bell(cx);
         self.terminal.update(cx, |terminal, _| {
             terminal.set_cursor_shape(self.cursor_shape);
             if !self.read_only {
@@ -2479,10 +2491,80 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn bell_clears_on_focus_and_refreshes_the_tab(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (pane, terminal, view) =
+            add_display_only_terminal(&project, window_handle, false, false, cx);
+        add_display_only_terminal(&project, window_handle, true, false, cx);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.blur(cx));
+        cx.run_until_parked();
+        let updates = Rc::new(std::cell::Cell::new(0));
+        let _subscription = view.update(&mut cx, |_, cx| {
+            cx.subscribe(&view, {
+                let updates = updates.clone();
+                move |_, _, event, _| {
+                    if matches!(event, ItemEvent::UpdateTab) {
+                        updates.set(updates.get() + 1);
+                    }
+                }
+            })
+        });
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_raw_output(b"\x07", cx)
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(&cx, |view, _| view.has_bell()));
+        let unread_updates = updates.get();
+        pane.update_in(&mut cx, |pane, window, cx| {
+            pane.activate_item(0, true, true, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(!view.read_with(&cx, |view, _| view.has_bell()));
+        assert!(
+            updates.get() > unread_updates,
+            "clearing a bell must redraw the tab"
+        );
+        let acknowledged_updates = updates.get();
+        view.update(&mut cx, |view, cx| view.clear_bell(cx));
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_raw_output(b"\x07", cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            !view.read_with(&cx, |view, _| view.has_bell()),
+            "a focused terminal is already being read"
+        );
+        assert_eq!(
+            updates.get(),
+            acknowledged_updates,
+            "acknowledged bells must not repeatedly invalidate tabs"
+        );
+        cx.deactivate_window();
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_raw_output(b"\x07", cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            view.read_with(&cx, |view, _| view.has_bell()),
+            "background windows still need unread notifications"
+        );
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert!(
+            !view.read_with(&cx, |view, _| view.has_bell()),
+            "returning to the focused terminal acknowledges the bell"
+        );
+    }
+
+    #[gpui::test]
     async fn plain_output_does_not_refresh_terminal_tabs(cx: &mut TestAppContext) {
         let (project, _workspace, window_handle) = init_test_with_window(cx).await;
         let (_pane, terminal, terminal_view) =
             add_display_only_terminal(&project, window_handle, false, true, cx);
+        add_display_only_terminal(&project, window_handle, true, true, cx);
         let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
         cx.run_until_parked();
         let tab_updates = Rc::new(std::cell::Cell::new(0));
@@ -2526,6 +2608,8 @@ mod tests {
             tab_updates.get() > 0,
             "renaming a terminal still needs to update its tab"
         );
+        cx.update(|window, cx| window.blur(cx));
+        cx.run_until_parked();
         let after_title = tab_updates.get();
         terminal.update(&mut cx, |terminal, cx| {
             terminal.write_raw_output(b"\x07", cx)

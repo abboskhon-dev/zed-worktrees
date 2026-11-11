@@ -55,7 +55,9 @@ the destination's panels have loaded, and does not copy running terminal process
 ### Agent completion bells
 
 A bell beside a worktree means one of its terminals rang the terminal bell or a terminal task finished.
-The marker stays until you visit the worktree. Ordinary output does not mark a worktree or redraw the
+The marker clears when you visit the worktree; notifications arriving while you are viewing that
+worktree do not mark it unread again. A terminal tab's bell clears when you select or focus that terminal.
+Ordinary output does not mark a worktree or redraw the
 navigator; subscriptions are shared for each terminal. The navigator does not infer completion from
 silence or parse the agent's output.
 
