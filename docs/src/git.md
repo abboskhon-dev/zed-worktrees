@@ -24,6 +24,10 @@ Use **Add project** to open a local project in the same window. Expand a project
 checkout and linked Git worktrees, including worktrees created from the command line. Use the refresh
 button to query Git directly; normal updates follow Zed’s repository watcher.
 
+Drag project headings to reorder projects. Drag worktree rows to reorder checkouts within a project;
+pinned worktrees stay together at the top. These orders are saved across restarts. Terminal tabs can
+also be dragged to reorder running sessions.
+
 Automatic updates reuse Zed's existing repository snapshots. Switching worktrees does not start
 extra Git discovery commands, and repeated refresh clicks share one in-flight request per project.
 The navigator's rendered subtree is cached independently from terminal output.

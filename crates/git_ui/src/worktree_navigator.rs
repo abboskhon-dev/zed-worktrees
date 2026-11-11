@@ -71,6 +71,7 @@ struct SerializedNavigator {
     width: Option<f32>,
     pinned_worktrees: Vec<PathBuf>,
     worktree_order: Vec<PathBuf>,
+    project_order: Vec<NavigatorProjectId>,
     hidden_worktrees: BTreeSet<PathBuf>,
     hidden_projects: BTreeSet<NavigatorProjectId>,
     collapsed_projects: BTreeSet<NavigatorProjectId>,
@@ -90,6 +91,26 @@ struct DraggedWorktree {
     label: SharedString,
     index: usize,
     pinned: bool,
+}
+
+#[derive(Clone)]
+struct DraggedProject {
+    navigator_id: gpui::EntityId,
+    project: NavigatorProjectId,
+    label: SharedString,
+    index: usize,
+}
+
+impl Render for DraggedProject {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .bg(cx.theme().colors().panel_background)
+            .child(Icon::new(IconName::Folder))
+            .child(Label::new(self.label.clone()))
+    }
 }
 
 impl Render for DraggedWorktree {
@@ -115,6 +136,7 @@ pub struct WorktreeNavigator {
     deleting_paths: HashSet<PathBuf>,
     pinned_worktrees: Vec<PathBuf>,
     worktree_order: Vec<PathBuf>,
+    project_order: Vec<NavigatorProjectId>,
     hidden_worktrees: BTreeSet<PathBuf>,
     hidden_projects: BTreeSet<NavigatorProjectId>,
     collapsed_projects: BTreeSet<NavigatorProjectId>,
@@ -185,6 +207,7 @@ impl WorktreeNavigator {
             deleting_paths: HashSet::default(),
             pinned_worktrees: Vec::new(),
             worktree_order: Vec::new(),
+            project_order: Vec::new(),
             hidden_worktrees: BTreeSet::default(),
             hidden_projects: BTreeSet::default(),
             collapsed_projects: BTreeSet::default(),
@@ -284,7 +307,8 @@ impl WorktreeNavigator {
         }
         self.repository_subscriptions
             .retain(|id, _| observed_stores.contains(id));
-        let projects = normalize_projects(projects);
+        let mut projects = normalize_projects(projects);
+        order_projects(&mut projects, &self.project_order);
         if self.projects != projects {
             self.projects = projects;
             cx.notify();
@@ -531,6 +555,35 @@ impl WorktreeNavigator {
             self.hidden_worktrees.remove(&path);
             self.pinned_worktrees.push(path);
         }
+        self.state_changed(cx);
+    }
+
+    fn reorder_project(
+        &mut self,
+        dragged: &DraggedProject,
+        target: &NavigatorProjectId,
+        cx: &mut Context<Self>,
+    ) {
+        if dragged.navigator_id != cx.entity().entity_id() || dragged.project.matches(target) {
+            return;
+        }
+        let Some(from) = self
+            .projects
+            .iter()
+            .position(|project| project.id().matches(&dragged.project))
+        else {
+            return;
+        };
+        let Some(to) = self
+            .projects
+            .iter()
+            .position(|project| project.id().matches(target))
+        else {
+            return;
+        };
+        let project = self.projects.remove(from);
+        self.projects.insert(to, project);
+        self.project_order = self.projects.iter().map(ProjectEntry::id).collect();
         self.state_changed(cx);
     }
 
@@ -997,6 +1050,15 @@ fn normalize_projects(projects: Vec<ProjectEntry>) -> Vec<ProjectEntry> {
     normalized
 }
 
+fn order_projects(projects: &mut [ProjectEntry], order: &[NavigatorProjectId]) {
+    projects.sort_by_key(|project| {
+        order
+            .iter()
+            .position(|id| id.matches(&project.id()))
+            .unwrap_or(usize::MAX)
+    });
+}
+
 fn sort_worktrees(worktrees: &mut Vec<GitWorktree>) {
     worktrees.retain(|worktree| !worktree.is_bare);
     worktrees.sort_by(|a, b| b.is_main.cmp(&a.is_main).then_with(|| a.path.cmp(&b.path)));
@@ -1076,6 +1138,7 @@ impl Sidebar for WorktreeNavigator {
             width: Some(self.width.into()),
             pinned_worktrees: self.pinned_worktrees.clone(),
             worktree_order: self.worktree_order.clone(),
+            project_order: self.project_order.clone(),
             hidden_worktrees: self.hidden_worktrees.clone(),
             hidden_projects: self.hidden_projects.clone(),
             collapsed_projects: self.collapsed_projects.clone(),
@@ -1086,6 +1149,8 @@ impl Sidebar for WorktreeNavigator {
         if let Some(state) = serde_json::from_str::<SerializedNavigator>(state).log_err() {
             self.pinned_worktrees = state.pinned_worktrees;
             self.worktree_order = state.worktree_order;
+            self.project_order = state.project_order;
+            order_projects(&mut self.projects, &self.project_order);
             self.hidden_worktrees = state.hidden_worktrees;
             self.hidden_projects = state.hidden_projects;
             self.collapsed_projects = state.collapsed_projects;
@@ -1117,39 +1182,72 @@ impl Render for WorktreeNavigator {
                 .iter()
                 .any(|collapsed| collapsed.matches(&project_id));
             let remove_id = project_id.clone();
+            let dragged = DraggedProject {
+                navigator_id: cx.entity().entity_id(),
+                project: project_id.clone(),
+                label: project_label(project),
+                index,
+            };
+            let target_id = project_id.clone();
+            let navigator_id = cx.entity().entity_id();
             rows.push(
-                ListItem::new(("navigator-project", index))
-                    .start_slot(Icon::new(if expanded {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
+                div()
+                    .id(("draggable-project", index))
+                    .debug_selector(move || format!("navigator-project-{index}"))
+                    .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+                    .can_drop(move |dragged, _, _| {
+                        dragged
+                            .downcast_ref::<DraggedProject>()
+                            .is_some_and(|dragged| dragged.navigator_id == navigator_id)
+                    })
+                    .drag_over::<DraggedProject>(move |row, dragged, _, cx| {
+                        let row = row
+                            .bg(cx.theme().colors().drop_target_background)
+                            .border_color(cx.theme().colors().drop_target_border);
+                        if dragged.index < index {
+                            row.border_b_2()
+                        } else {
+                            row.border_t_2()
+                        }
+                    })
+                    .on_drop(cx.listener(move |this, dragged: &DraggedProject, _, cx| {
+                        this.reorder_project(dragged, &target_id, cx);
+                        cx.stop_propagation();
                     }))
-                    .child(Label::new(project_label(project)).truncate())
-                    .end_slot(
-                        IconButton::new(("remove-project", index), IconName::Close)
-                            .icon_size(IconSize::Small)
-                            .aria_label("Remove project from sidebar")
-                            .tooltip(Tooltip::text(
-                                "Remove project from sidebar (keep files and sessions)",
-                            ))
+                    .child(
+                        ListItem::new(("navigator-project", index))
+                            .start_slot(Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            }))
+                            .child(Label::new(project_label(project)).truncate())
+                            .end_slot(
+                                IconButton::new(("remove-project", index), IconName::Close)
+                                    .icon_size(IconSize::Small)
+                                    .aria_label("Remove project from sidebar")
+                                    .tooltip(Tooltip::text(
+                                        "Remove project from sidebar (keep files and sessions)",
+                                    ))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.remove_project_entry(remove_id.clone(), cx);
+                                    })),
+                            )
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.remove_project_entry(remove_id.clone(), cx);
+                                if this
+                                    .collapsed_projects
+                                    .iter()
+                                    .any(|collapsed| collapsed.matches(&project_id))
+                                {
+                                    this.collapsed_projects
+                                        .retain(|collapsed| !collapsed.matches(&project_id));
+                                } else {
+                                    this.collapsed_projects.insert(project_id.clone());
+                                }
+                                this.state_changed(cx);
                             })),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if this
-                            .collapsed_projects
-                            .iter()
-                            .any(|collapsed| collapsed.matches(&project_id))
-                        {
-                            this.collapsed_projects
-                                .retain(|collapsed| !collapsed.matches(&project_id));
-                        } else {
-                            this.collapsed_projects.insert(project_id.clone());
-                        }
-                        this.state_changed(cx);
-                    }))
                     .into_any_element(),
             );
             if !expanded {
@@ -1837,6 +1935,86 @@ mod tests {
             .advance_clock(std::time::Duration::from_secs(1));
         cx.run_until_parked();
         (repository, path)
+    }
+
+    #[gpui::test]
+    async fn dragged_project_order_survives_refresh_and_restoration(cx: &mut TestAppContext) {
+        let (_fs, multi_workspace, navigator, _workspace_a, workspace_b, mut cx) = setup(cx).await;
+        let original = navigator.update(&mut cx, |navigator, cx| {
+            let ids: Vec<_> = navigator.projects.iter().map(ProjectEntry::id).collect();
+            navigator.collapsed_projects.extend(ids.iter().cloned());
+            navigator.state_changed(cx);
+            ids
+        });
+        cx.run_until_parked();
+        let start = cx
+            .debug_bounds("navigator-project-0")
+            .expect("first project heading")
+            .center();
+        let end = cx
+            .debug_bounds("navigator-project-1")
+            .expect("second project heading")
+            .center();
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            start + gpui::point(px(0.), px(8.)),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            end,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let expected: Vec<_> = original.into_iter().rev().collect();
+        navigator.update_in(&mut cx, |navigator, window, cx| {
+            assert!(
+                navigator
+                    .projects
+                    .iter()
+                    .map(ProjectEntry::id)
+                    .eq(expected.iter().cloned())
+            );
+            navigator.refresh(window, cx);
+        });
+        cx.run_until_parked();
+        let state = navigator.read_with(&cx, |navigator, cx| {
+            assert!(
+                navigator
+                    .projects
+                    .iter()
+                    .map(ProjectEntry::id)
+                    .eq(expected.iter().cloned())
+            );
+            navigator.serialized_state(cx).unwrap()
+        });
+        let restored = cx.update(|window, cx| {
+            cx.new(|cx| WorktreeNavigator::new(multi_workspace.clone(), window, cx))
+        });
+        restored.update_in(&mut cx, |navigator, window, cx| {
+            navigator.restore_serialized_state(&state, window, cx)
+        });
+        cx.run_until_parked();
+        restored.read_with(&cx, |navigator, _| {
+            assert!(
+                navigator
+                    .projects
+                    .iter()
+                    .map(ProjectEntry::id)
+                    .eq(expected.iter().cloned())
+            );
+            assert!(
+                expected
+                    .iter()
+                    .all(|id| navigator.collapsed_projects.contains(id))
+            );
+        });
+        multi_workspace.read_with(&cx, |multi_workspace, _| {
+            assert_eq!(multi_workspace.workspace(), &workspace_b);
+            assert_eq!(multi_workspace.workspaces().count(), 2);
+        });
     }
 
     #[gpui::test]
