@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, ensure};
 use collections::{BTreeSet, HashMap, HashSet};
-use git::repository::{Worktree as GitWorktree, original_repo_path_from_common_dir};
+use git::repository::{
+    Worktree as GitWorktree, WorktreeStatus, original_repo_path_from_common_dir,
+};
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, PromptLevel, Render, ScrollHandle,
     Subscription, Task, WeakEntity, Window,
@@ -147,6 +149,9 @@ pub struct WorktreeNavigator {
     repository_subscriptions: HashMap<gpui::EntityId, Subscription>,
     terminal_subscriptions: HashMap<gpui::EntityId, Subscription>,
     notified_paths: HashSet<PathBuf>,
+    worktree_statuses: HashMap<PathBuf, WorktreeStatus>,
+    status_task: Option<Task<()>>,
+    status_refresh_pending: bool,
 }
 
 impl WorktreeNavigator {
@@ -192,10 +197,14 @@ impl WorktreeNavigator {
                         cx.notify();
                     }
                     this.refresh(window, cx);
+                    this.schedule_status_refresh(cx);
                 }
             }),
         ];
-        cx.defer_in(window, |this, window, cx| this.refresh(window, cx));
+        cx.defer_in(window, |this, window, cx| {
+            this.refresh(window, cx);
+            this.schedule_status_refresh(cx);
+        });
         Self {
             multi_workspace: multi_workspace.downgrade(),
             focus_handle: cx.focus_handle(),
@@ -218,6 +227,9 @@ impl WorktreeNavigator {
             repository_subscriptions: HashMap::default(),
             terminal_subscriptions: HashMap::default(),
             notified_paths: HashSet::default(),
+            worktree_statuses: HashMap::default(),
+            status_task: None,
+            status_refresh_pending: false,
         }
     }
 
@@ -247,6 +259,19 @@ impl WorktreeNavigator {
                     .entry(store_id)
                     .or_insert_with(|| {
                         cx.subscribe_in(&git_store, window, |this, _, event, window, cx| {
+                            if matches!(
+                                event,
+                                GitStoreEvent::RepositoryUpdated(
+                                    _,
+                                    RepositoryEvent::StatusesChanged
+                                        | RepositoryEvent::HeadChanged
+                                        | RepositoryEvent::BranchListChanged
+                                        | RepositoryEvent::GitWorktreeListChanged,
+                                    _
+                                )
+                            ) {
+                                this.schedule_status_refresh(cx);
+                            }
                             if matches!(
                                 event,
                                 GitStoreEvent::RepositoryAdded
@@ -538,9 +563,100 @@ impl WorktreeNavigator {
                     if changed {
                         cx.notify();
                     }
+                    this.schedule_status_refresh(cx);
                 })
                 .log_err();
             }));
+    }
+
+    fn schedule_status_refresh(&mut self, cx: &mut Context<Self>) {
+        // Each request is a queued Git job, so overlapping refreshes collapse into one rerun.
+        if self
+            .status_task
+            .as_ref()
+            .is_some_and(|task| !task.is_ready())
+        {
+            self.status_refresh_pending = true;
+            return;
+        }
+        self.status_refresh_pending = false;
+        self.status_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(STATUS_REFRESH_DEBOUNCE)
+                .await;
+            let Ok(requests) = this.update(cx, |this, cx| this.status_requests(cx)) else {
+                return;
+            };
+            let statuses =
+                futures::future::join_all(requests.into_iter().map(|(path, request)| async move {
+                    let status = request
+                        .await
+                        .context("Git status request cancelled")
+                        .and_then(|result| result)
+                        .log_err();
+                    (path, status)
+                }))
+                .await;
+            this.update(cx, |this, cx| {
+                let statuses: HashMap<_, _> = statuses
+                    .into_iter()
+                    .filter_map(|(path, status)| Some((path, status?)))
+                    .collect();
+                if this.worktree_statuses != statuses {
+                    this.worktree_statuses = statuses;
+                    cx.notify();
+                }
+                if this.status_refresh_pending {
+                    this.status_task = None;
+                    this.schedule_status_refresh(cx);
+                }
+            })
+            .log_err();
+        }));
+    }
+
+    fn status_requests(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Vec<(
+        PathBuf,
+        futures::channel::oneshot::Receiver<Result<WorktreeStatus>>,
+    )> {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return Vec::new();
+        };
+        let repositories: Vec<_> = multi_workspace
+            .read(cx)
+            .workspaces()
+            .filter_map(|workspace| {
+                let project = workspace.read(cx).project().read(cx);
+                project
+                    .is_local()
+                    .then(|| project.active_repository(cx))
+                    .flatten()
+            })
+            .collect();
+        let mut requests = Vec::new();
+        for project in &self.projects {
+            let Some(repository_dir) = &project.repository_dir else {
+                continue;
+            };
+            let Some(repository) = repositories.iter().find(|repository| {
+                repository.read(cx).common_dir_abs_path.as_ref() == repository_dir.as_path()
+            }) else {
+                continue;
+            };
+            for worktree in &project.worktrees {
+                if worktree.is_bare || self.hidden_worktrees.contains(&worktree.path) {
+                    continue;
+                }
+                let path = worktree.path.clone();
+                let request =
+                    repository.update(cx, |repository, _| repository.worktree_status(path.clone()));
+                requests.push((path, request));
+            }
+        }
+        requests
     }
 
     fn state_changed(&self, cx: &mut Context<Self>) {
@@ -1059,6 +1175,8 @@ fn order_projects(projects: &mut [ProjectEntry], order: &[NavigatorProjectId]) {
     });
 }
 
+const STATUS_REFRESH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+
 fn sort_worktrees(worktrees: &mut Vec<GitWorktree>) {
     worktrees.retain(|worktree| !worktree.is_bare);
     worktrees.sort_by(|a, b| b.is_main.cmp(&a.is_main).then_with(|| a.path.cmp(&b.path)));
@@ -1080,6 +1198,47 @@ fn worktree_label(worktree: &GitWorktree) -> SharedString {
                 .to_string_lossy();
             format!("{name} (detached)").into()
         })
+}
+
+fn render_status(status: WorktreeStatus) -> impl IntoElement {
+    let (ahead, behind) = status.ahead_behind.unwrap_or_default();
+    h_flex()
+        .flex_shrink_0()
+        .gap_1()
+        .when(status.changed_files > 0, |row| {
+            row.child(
+                Label::new(format!("●{}", status.changed_files))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Warning),
+            )
+        })
+        .when(ahead > 0, |row| {
+            row.child(
+                Label::new(format!("↑{ahead}"))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+        })
+        .when(behind > 0, |row| {
+            row.child(
+                Label::new(format!("↓{behind}"))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+        })
+}
+
+fn status_description(status: WorktreeStatus) -> String {
+    let changes = match status.changed_files {
+        0 => "No uncommitted changes".to_string(),
+        1 => "1 changed file".to_string(),
+        count => format!("{count} changed files"),
+    };
+    match status.ahead_behind {
+        Some((0, 0)) => format!("{changes}, up to date with upstream"),
+        Some((ahead, behind)) => format!("{changes}, {ahead} ahead and {behind} behind upstream"),
+        None => format!("{changes}, no upstream branch"),
+    }
 }
 
 fn project_label(project: &ProjectEntry) -> SharedString {
@@ -1264,6 +1423,7 @@ impl Render for WorktreeNavigator {
                     self.loading_paths.contains(&path) || self.deleting_paths.contains(&path);
                 let pinned = self.pinned_worktrees.contains(&path);
                 let notified = self.notified_paths.contains(&path);
+                let status = self.worktree_statuses.get(&path).copied();
                 let pin_path = path.clone();
                 let delete_path = path.clone();
                 let menu_path = path.clone();
@@ -1278,14 +1438,16 @@ impl Render for WorktreeNavigator {
                 let drop_path = path.clone();
                 let drop_project = project.id();
                 let navigator_id = cx.entity().entity_id();
-                let tooltip = if notified {
-                    format!(
-                        "{}\nTerminal notification: an agent rang the bell or a task finished.",
-                        path.display()
-                    )
-                } else {
-                    path.display().to_string()
-                };
+                let mut tooltip = path.display().to_string();
+                if let Some(status) = status {
+                    tooltip.push('\n');
+                    tooltip.push_str(&status_description(status));
+                }
+                if notified {
+                    tooltip.push_str(
+                        "\nTerminal notification: an agent rang the bell or a task finished.",
+                    );
+                }
                 let item = ListItem::new(SharedString::from(format!(
                     "navigator-worktree-{index}-{row}"
                 )))
@@ -1309,6 +1471,7 @@ impl Render for WorktreeNavigator {
                         .min_w_0()
                         .gap_1()
                         .child(div().flex_1().min_w_0().child(Label::new(label).truncate()))
+                        .when_some(status, |row, status| row.child(render_status(status)))
                         .when(notified, |row| {
                             row.child(
                                 Icon::new(IconName::Bell)
@@ -2672,6 +2835,43 @@ mod tests {
                     .is_some_and(|error| error.contains("no longer exists"))
             )
         });
+    }
+
+    #[gpui::test]
+    async fn linked_worktree_rows_show_their_git_status(cx: &mut TestAppContext) {
+        let (fs, _multi_workspace, navigator, workspace_a, _workspace_b, mut cx) = setup(cx).await;
+        let (_repository, linked_path) = create_linked_worktree(&workspace_a, &mut cx).await;
+        let linked_status = WorktreeStatus {
+            changed_files: 2,
+            ahead_behind: Some((1, 3)),
+        };
+        fs.with_git_state(Path::new(path!("/project-a/.git")), false, |state| {
+            state
+                .worktree_statuses
+                .insert(linked_path.clone(), linked_status);
+        })
+        .unwrap();
+        navigator.update(&mut cx, |navigator, cx| {
+            navigator.schedule_status_refresh(cx)
+        });
+        cx.executor().advance_clock(STATUS_REFRESH_DEBOUNCE);
+        cx.run_until_parked();
+        navigator.read_with(&cx, |navigator, _| {
+            assert_eq!(
+                navigator.worktree_statuses.get(&linked_path),
+                Some(&linked_status)
+            );
+            assert_eq!(
+                navigator
+                    .worktree_statuses
+                    .get(Path::new(path!("/project-a"))),
+                Some(&WorktreeStatus::default())
+            );
+        });
+        assert_eq!(
+            status_description(linked_status),
+            "2 changed files, 1 ahead and 3 behind upstream"
+        );
     }
 
     #[gpui::test]

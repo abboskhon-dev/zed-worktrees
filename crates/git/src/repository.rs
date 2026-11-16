@@ -288,6 +288,34 @@ impl Branch {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
+pub struct WorktreeStatus {
+    pub changed_files: usize,
+    /// `None` when the checked-out branch has no upstream.
+    pub ahead_behind: Option<(u32, u32)>,
+}
+
+pub fn parse_worktree_status(output: &str) -> WorktreeStatus {
+    let mut status = WorktreeStatus::default();
+    for line in output.lines() {
+        if let Some(counts) = line.strip_prefix("# branch.ab ") {
+            let mut parts = counts.split_whitespace();
+            let ahead = parts
+                .next()
+                .and_then(|part| part.strip_prefix('+'))
+                .and_then(|count| count.parse().ok());
+            let behind = parts
+                .next()
+                .and_then(|part| part.strip_prefix('-'))
+                .and_then(|count| count.parse().ok());
+            status.ahead_behind = ahead.zip(behind);
+        } else if !line.starts_with('#') && !line.is_empty() {
+            status.changed_files += 1;
+        }
+    }
+    status
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Worktree {
     pub path: PathBuf,
@@ -899,6 +927,8 @@ pub trait GitRepository: Send + Sync {
     ) -> BoxFuture<'_, Result<()>>;
 
     fn remove_worktree(&self, path: PathBuf, force: bool) -> BoxFuture<'_, Result<()>>;
+
+    fn worktree_status(&self, worktree_path: PathBuf) -> BoxFuture<'_, Result<WorktreeStatus>>;
 
     fn rename_worktree(&self, old_path: PathBuf, new_path: PathBuf) -> BoxFuture<'_, Result<()>>;
 
@@ -2328,6 +2358,24 @@ impl GitRepository for RealGitRepository {
                 args.push(path.as_os_str().into());
                 git.run(&args).await?;
                 anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn worktree_status(&self, worktree_path: PathBuf) -> BoxFuture<'_, Result<WorktreeStatus>> {
+        let git_binary = GitBinary::new(
+            self.any_git_binary_path.clone(),
+            worktree_path,
+            self.path(),
+            self.executor.clone(),
+            self.is_trusted(),
+        );
+        self.executor
+            .spawn(async move {
+                let output = git_binary
+                    .run(&["status", "--porcelain=v2", "--branch"])
+                    .await?;
+                Ok(parse_worktree_status(&output))
             })
             .boxed()
     }
@@ -4316,6 +4364,22 @@ mod tests {
 
     use super::*;
     use gpui::TestAppContext;
+
+    #[test]
+    fn parses_worktree_status_counts() {
+        let output = "# branch.oid abc\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +2 -5\n1 .M N... 100644 100644 100644 a b src/a.rs\n2 R. N... 100644 100644 100644 a b R100 new.rs\told.rs\n? untracked.txt";
+        assert_eq!(
+            parse_worktree_status(output),
+            WorktreeStatus {
+                changed_files: 3,
+                ahead_behind: Some((2, 5)),
+            }
+        );
+        assert_eq!(
+            parse_worktree_status("# branch.oid abc\n# branch.head feature"),
+            WorktreeStatus::default()
+        );
+    }
 
     #[test]
     fn test_create_ref_requires_ref_to_not_exist() {

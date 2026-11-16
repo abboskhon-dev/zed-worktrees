@@ -16,7 +16,7 @@ use git::{
         CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, GRAPH_CHUNK_SIZE,
         GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
         PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
-        commit_hash_search_query,
+        WorktreeStatus, commit_hash_search_query,
     },
     stash::GitStash,
     status::{
@@ -77,6 +77,7 @@ pub struct FakeGitRepositoryState {
     pub simulated_graph_error: Option<String>,
     pub branches_requiring_force_delete: HashSet<String>,
     pub worktrees_requiring_force_delete: HashSet<PathBuf>,
+    pub worktree_statuses: HashMap<PathBuf, WorktreeStatus>,
     pub refs: HashMap<String, String>,
     pub graph_commits: Vec<Arc<InitialGraphCommitData>>,
     pub commit_data: HashMap<Oid, FakeCommitDataEntry>,
@@ -102,6 +103,7 @@ impl FakeGitRepositoryState {
             simulated_graph_error: None,
             branches_requiring_force_delete: Default::default(),
             worktrees_requiring_force_delete: Default::default(),
+            worktree_statuses: Default::default(),
             refs: HashMap::from_iter([("HEAD".into(), "abc".into())]),
             merge_base_contents: Default::default(),
             oids: Default::default(),
@@ -942,6 +944,23 @@ impl GitRepository for FakeGitRepository {
             }
 
             Ok(())
+        }
+        .boxed()
+    }
+
+    fn worktree_status(&self, worktree_path: PathBuf) -> BoxFuture<'_, Result<WorktreeStatus>> {
+        let fs = self.fs.clone();
+        let executor = self.executor.clone();
+        let common_dir_path = self.common_dir_path.clone();
+        async move {
+            executor.simulate_random_delay().await;
+            fs.with_git_state(&common_dir_path, false, |state| {
+                state
+                    .worktree_statuses
+                    .get(&worktree_path)
+                    .copied()
+                    .unwrap_or_default()
+            })
         }
         .boxed()
     }

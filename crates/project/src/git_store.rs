@@ -42,8 +42,8 @@ use git::{
         CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions, FileHistoryChangedFileSets,
         GitCommitTemplate, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData,
         LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode,
-        SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag,
-        is_binary_content,
+        SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree, WorktreeStatus,
+        delete_branch_flag, is_binary_content,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -9584,6 +9584,19 @@ impl Repository {
                 }
             },
         )
+    }
+
+    pub fn worktree_status(&mut self, path: PathBuf) -> oneshot::Receiver<Result<WorktreeStatus>> {
+        self.send_job("worktree_status", None, move |repo, _| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.worktree_status(path).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("worktree status is only available for local repositories")
+                }
+            }
+        })
     }
 
     pub fn remove_worktree(&mut self, path: PathBuf, force: bool) -> oneshot::Receiver<Result<()>> {
