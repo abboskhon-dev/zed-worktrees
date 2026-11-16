@@ -9586,9 +9586,11 @@ impl Repository {
         )
     }
 
-    pub fn worktree_status(&mut self, path: PathBuf) -> oneshot::Receiver<Result<WorktreeStatus>> {
-        self.send_job("worktree_status", None, move |repo, _| async move {
-            match repo {
+    // Read-only, so it bypasses the job queue instead of delaying user Git operations.
+    pub fn worktree_status(&self, path: PathBuf, cx: &App) -> Task<Result<WorktreeStatus>> {
+        let repository_state = self.repository_state.clone();
+        cx.background_spawn(async move {
+            match repository_state.await.map_err(|error| anyhow!(error))? {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     backend.worktree_status(path).await
                 }

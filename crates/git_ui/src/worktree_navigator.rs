@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, ensure};
 use collections::{BTreeSet, HashMap, HashSet};
 use git::repository::{
-    Worktree as GitWorktree, WorktreeStatus, original_repo_path_from_common_dir,
+    UpstreamTrackingStatus, Worktree as GitWorktree, WorktreeStatus,
+    original_repo_path_from_common_dir,
 };
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, PromptLevel, Render, ScrollHandle,
@@ -251,8 +252,15 @@ impl WorktreeNavigator {
                 .find(|workspace| workspace.read(cx).project().read(cx).is_local());
             let repository = representative
                 .and_then(|workspace| workspace.read(cx).project().read(cx).active_repository(cx));
-            if let Some(workspace) = representative {
-                let git_store = workspace.read(cx).project().read(cx).git_store().clone();
+            // Linked worktrees open in their own workspaces have separate Git stores.
+            let git_stores: Vec<_> = group
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.read(cx).project().read(cx))
+                .filter(|project| project.is_local())
+                .map(|project| project.git_store().clone())
+                .collect();
+            for git_store in git_stores {
                 let store_id = git_store.entity_id();
                 observed_stores.insert(store_id);
                 self.repository_subscriptions
@@ -570,7 +578,7 @@ impl WorktreeNavigator {
     }
 
     fn schedule_status_refresh(&mut self, cx: &mut Context<Self>) {
-        // Each request is a queued Git job, so overlapping refreshes collapse into one rerun.
+        // Overlapping refreshes collapse into one rerun instead of racing Git processes.
         if self
             .status_task
             .as_ref()
@@ -579,24 +587,23 @@ impl WorktreeNavigator {
             self.status_refresh_pending = true;
             return;
         }
-        self.status_refresh_pending = false;
         self.status_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(STATUS_REFRESH_DEBOUNCE)
                 .await;
-            let Ok(requests) = this.update(cx, |this, cx| this.status_requests(cx)) else {
+            // Requests read the latest state, so triggers during the debounce need no rerun.
+            let Ok(requests) = this.update(cx, |this, cx| {
+                this.status_refresh_pending = false;
+                this.status_requests(cx)
+            }) else {
                 return;
             };
-            let statuses =
-                futures::future::join_all(requests.into_iter().map(|(path, request)| async move {
-                    let status = request
-                        .await
-                        .context("Git status request cancelled")
-                        .and_then(|result| result)
-                        .log_err();
-                    (path, status)
-                }))
-                .await;
+            let statuses = futures::future::join_all(
+                requests
+                    .into_iter()
+                    .map(|(path, request)| async move { (path, request.await.log_err()) }),
+            )
+            .await;
             this.update(cx, |this, cx| {
                 let statuses: HashMap<_, _> = statuses
                     .into_iter()
@@ -615,13 +622,7 @@ impl WorktreeNavigator {
         }));
     }
 
-    fn status_requests(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Vec<(
-        PathBuf,
-        futures::channel::oneshot::Receiver<Result<WorktreeStatus>>,
-    )> {
+    fn status_requests(&self, cx: &App) -> Vec<(PathBuf, Task<Result<WorktreeStatus>>)> {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return Vec::new();
         };
@@ -647,12 +648,11 @@ impl WorktreeNavigator {
                 continue;
             };
             for worktree in &project.worktrees {
-                if worktree.is_bare || self.hidden_worktrees.contains(&worktree.path) {
+                if self.hidden_worktrees.contains(&worktree.path) {
                     continue;
                 }
                 let path = worktree.path.clone();
-                let request =
-                    repository.update(cx, |repository, _| repository.worktree_status(path.clone()));
+                let request = repository.read(cx).worktree_status(path.clone(), cx);
                 requests.push((path, request));
             }
         }
@@ -1201,7 +1201,9 @@ fn worktree_label(worktree: &GitWorktree) -> SharedString {
 }
 
 fn render_status(status: WorktreeStatus) -> impl IntoElement {
-    let (ahead, behind) = status.ahead_behind.unwrap_or_default();
+    let (ahead, behind) = status
+        .upstream
+        .map_or((0, 0), |upstream| (upstream.ahead, upstream.behind));
     h_flex()
         .flex_shrink_0()
         .gap_1()
@@ -1234,9 +1236,14 @@ fn status_description(status: WorktreeStatus) -> String {
         1 => "1 changed file".to_string(),
         count => format!("{count} changed files"),
     };
-    match status.ahead_behind {
-        Some((0, 0)) => format!("{changes}, up to date with upstream"),
-        Some((ahead, behind)) => format!("{changes}, {ahead} ahead and {behind} behind upstream"),
+    match status.upstream {
+        Some(UpstreamTrackingStatus {
+            ahead: 0,
+            behind: 0,
+        }) => format!("{changes}, up to date with upstream"),
+        Some(UpstreamTrackingStatus { ahead, behind }) => {
+            format!("{changes}, {ahead} ahead and {behind} behind upstream")
+        }
         None => format!("{changes}, no upstream branch"),
     }
 }
@@ -2843,7 +2850,10 @@ mod tests {
         let (_repository, linked_path) = create_linked_worktree(&workspace_a, &mut cx).await;
         let linked_status = WorktreeStatus {
             changed_files: 2,
-            ahead_behind: Some((1, 3)),
+            upstream: Some(UpstreamTrackingStatus {
+                ahead: 1,
+                behind: 3,
+            }),
         };
         fs.with_git_state(Path::new(path!("/project-a/.git")), false, |state| {
             state

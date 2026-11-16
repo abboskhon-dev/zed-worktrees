@@ -292,7 +292,7 @@ impl Branch {
 pub struct WorktreeStatus {
     pub changed_files: usize,
     /// `None` when the checked-out branch has no upstream.
-    pub ahead_behind: Option<(u32, u32)>,
+    pub upstream: Option<UpstreamTrackingStatus>,
 }
 
 pub fn parse_worktree_status(output: &str) -> WorktreeStatus {
@@ -308,7 +308,9 @@ pub fn parse_worktree_status(output: &str) -> WorktreeStatus {
                 .next()
                 .and_then(|part| part.strip_prefix('-'))
                 .and_then(|count| count.parse().ok());
-            status.ahead_behind = ahead.zip(behind);
+            status.upstream = ahead
+                .zip(behind)
+                .map(|(ahead, behind)| UpstreamTrackingStatus { ahead, behind });
         } else if !line.starts_with('#') && !line.is_empty() {
             status.changed_files += 1;
         }
@@ -4372,7 +4374,10 @@ mod tests {
             parse_worktree_status(output),
             WorktreeStatus {
                 changed_files: 3,
-                ahead_behind: Some((2, 5)),
+                upstream: Some(UpstreamTrackingStatus {
+                    ahead: 2,
+                    behind: 5,
+                }),
             }
         );
         assert_eq!(
