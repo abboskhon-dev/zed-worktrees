@@ -3402,6 +3402,57 @@ async fn test_disk_based_diagnostics_progress(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_idle_language_servers_stop_and_resume(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "" })).await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut fake_servers = language_registry.register_fake_lsp("Rust", FakeLspAdapter::default());
+    let server_count = |cx: &mut gpui::TestAppContext| {
+        project.read_with(cx, |project, cx| {
+            project.language_server_statuses(cx).count()
+        })
+    };
+
+    let (_buffer, handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    fake_servers.next().await.unwrap();
+    cx.executor().run_until_parked();
+    assert_eq!(server_count(cx), 1);
+
+    project.update(cx, |project, cx| {
+        project
+            .lsp_store()
+            .update(cx, |lsp_store, cx| lsp_store.suspend_language_servers(cx));
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(server_count(cx), 0);
+
+    project.update(cx, |project, cx| {
+        project
+            .lsp_store()
+            .update(cx, |lsp_store, cx| lsp_store.resume_language_servers(cx));
+    });
+    fake_servers.next().await.unwrap();
+    cx.executor().run_until_parked();
+    assert_eq!(server_count(cx), 1);
+
+    cx.update(|_| drop(handle));
+    cx.executor().run_until_parked();
+    assert_eq!(server_count(cx), 1);
+    cx.executor().advance_clock(Duration::from_secs(61));
+    cx.executor().run_until_parked();
+    assert_eq!(server_count(cx), 0);
+}
+
+#[gpui::test]
 async fn test_restarting_server_with_diagnostics_running(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 

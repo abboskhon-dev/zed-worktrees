@@ -24,6 +24,8 @@ use settings::SidebarDockPosition;
 use ui::{ContextMenu, right_click_menu};
 
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
+const INACTIVE_WORKSPACE_LANGUAGE_SERVER_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
 
 use crate::open_remote_project_with_existing_connection;
 use crate::{
@@ -317,6 +319,7 @@ pub struct MultiWorkspace {
     sidebar_open: bool,
     sidebar_overlay: Option<AnyView>,
     pending_removal_tasks: Vec<Task<()>>,
+    language_server_suspend_tasks: collections::HashMap<EntityId, Task<()>>,
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     previous_focus_handle: Option<FocusHandle>,
@@ -376,6 +379,7 @@ impl MultiWorkspace {
             sidebar_open: false,
             sidebar_overlay: None,
             pending_removal_tasks: Vec::new(),
+            language_server_suspend_tasks: collections::HashMap::default(),
             _serialize_task: None,
             _subscriptions: vec![release_subscription, settings_subscription],
             previous_focus_handle: None,
@@ -1300,11 +1304,59 @@ impl MultiWorkspace {
         let key = workspace.read(cx).project_group_key(cx);
         let index = self.hold(workspace, window, cx);
         self.pin(index, key, cx);
+        self.schedule_language_server_suspension(cx);
         telemetry::event!(
             "Workspace Added",
             workspace_count = self.held.iter().filter(|held| held.pinned).count()
         );
         cx.notify();
+    }
+
+    fn schedule_language_server_suspension(&mut self, cx: &mut Context<Self>) {
+        let active_workspace = self.workspace().clone();
+        let active_project = active_workspace.read(cx).project().clone();
+        self.language_server_suspend_tasks
+            .remove(&active_workspace.entity_id());
+        active_project.update(cx, |project, cx| {
+            project
+                .lsp_store()
+                .update(cx, |lsp_store, cx| lsp_store.resume_language_servers(cx));
+        });
+
+        let held_ids = self
+            .held
+            .iter()
+            .map(|held| held.workspace.entity_id())
+            .collect::<collections::HashSet<_>>();
+        self.language_server_suspend_tasks
+            .retain(|workspace_id, _| held_ids.contains(workspace_id));
+        for held in &self.held {
+            let workspace_id = held.workspace.entity_id();
+            let project = held.workspace.read(cx).project().clone();
+            if workspace_id == active_workspace.entity_id()
+                || project == active_project
+                || self
+                    .language_server_suspend_tasks
+                    .contains_key(&workspace_id)
+            {
+                continue;
+            }
+            let project = project.downgrade();
+            let task = cx.spawn(async move |_, cx| {
+                cx.background_executor()
+                    .timer(INACTIVE_WORKSPACE_LANGUAGE_SERVER_TIMEOUT)
+                    .await;
+                project
+                    .update(cx, |project, cx| {
+                        project
+                            .lsp_store()
+                            .update(cx, |lsp_store, cx| lsp_store.suspend_language_servers(cx));
+                    })
+                    .ok();
+            });
+            self.language_server_suspend_tasks
+                .insert(workspace_id, task);
+        }
     }
 
     /// Ensures the workspace is in the multiworkspace and makes it the active one.
@@ -1360,6 +1412,7 @@ impl MultiWorkspace {
             workspace.refresh_window_state(window, cx);
         });
 
+        self.schedule_language_server_suspension(cx);
         cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged { source_workspace });
         self.serialize(cx);
         self.focus_active_workspace(window, cx);

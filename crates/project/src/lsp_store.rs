@@ -181,6 +181,7 @@ const CROSS_BUFFER_DIAGNOSTICS_PULL_DELAY: Duration = Duration::from_millis(100)
 const DOCUMENT_DIAGNOSTICS_RETRIGGER_LIMIT: usize = 3;
 const DOCUMENT_DIAGNOSTICS_RETRIGGER_DELAY: Duration = Duration::from_millis(100);
 const SERVER_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
+const CLOSED_WORKTREE_LANGUAGE_SERVER_GRACE: Duration = Duration::from_secs(60);
 static NEXT_PROMPT_REQUEST_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// Refresh messages carry a monotonic id for backwards compatibility only: older peers
@@ -360,6 +361,8 @@ pub struct LocalLspStore {
     auto_start_language_servers: bool,
     language_server_start_overrides: HashMap<LanguageServerName, bool>,
     language_server_restart_tasks: Vec<Task<()>>,
+    worktree_language_server_shutdown_tasks: HashMap<WorktreeId, Task<()>>,
+    language_servers_suspended: bool,
 
     buffers_to_refresh_hash_set: HashSet<BufferId>,
     buffers_to_refresh_queue: VecDeque<BufferId>,
@@ -4984,6 +4987,8 @@ impl LspStore {
                 auto_start_language_servers: true,
                 language_server_start_overrides: HashMap::default(),
                 language_server_restart_tasks: Vec::new(),
+                worktree_language_server_shutdown_tasks: HashMap::default(),
+                language_servers_suspended: false,
                 watched_manifest_filenames: ManifestProvidersStore::global(cx)
                     .manifest_file_names(),
             }),
@@ -5358,6 +5363,9 @@ impl LspStore {
             }
 
             if *refcount == 1 {
+                local
+                    .worktree_language_server_shutdown_tasks
+                    .remove(&file.worktree_id(cx));
                 local.register_buffer_with_language_servers(
                     buffer,
                     only_register_servers,
@@ -5417,6 +5425,7 @@ impl LspStore {
                             },
                             cx,
                         );
+                        lsp_store.schedule_closed_worktree_shutdown(file.worktree_id(cx), cx);
                     }
                 }
             })
@@ -13007,6 +13016,122 @@ impl LspStore {
             cx.emit(LspStoreEvent::LanguageServerRemoved(server_id));
         }
         Task::ready(())
+    }
+
+    /// Stops every local server until `resume_language_servers`, keeping buffer registrations.
+    pub fn suspend_language_servers(&mut self, cx: &mut Context<Self>) {
+        let Some(local) = self.as_local_mut() else {
+            return;
+        };
+        if local.language_server_ids.is_empty() {
+            return;
+        }
+        local.language_servers_suspended = true;
+        local.worktree_language_server_shutdown_tasks.clear();
+        self.shutdown_all_language_servers(cx).detach();
+    }
+
+    pub fn resume_language_servers(&mut self, cx: &mut Context<Self>) {
+        let Some(local) = self.as_local_mut() else {
+            return;
+        };
+        if !std::mem::take(&mut local.language_servers_suspended) {
+            return;
+        }
+        let buffer_ids = local.registered_buffers.keys().copied().collect::<Vec<_>>();
+        let buffers = buffer_ids
+            .into_iter()
+            .filter_map(|buffer_id| self.buffer_store.read(cx).get(buffer_id))
+            .collect::<Vec<_>>();
+        let Some(local) = self.as_local_mut() else {
+            return;
+        };
+        for buffer in &buffers {
+            local.register_buffer_with_language_servers(
+                buffer,
+                HashSet::default(),
+                LanguageServerStartMode::Automatic,
+                cx,
+            );
+        }
+    }
+
+    fn worktree_has_registered_buffers(&self, worktree_id: WorktreeId, cx: &App) -> bool {
+        let Some(local) = self.as_local() else {
+            return false;
+        };
+        let buffer_store = self.buffer_store.read(cx);
+        local.registered_buffers.keys().any(|buffer_id| {
+            buffer_store.get(*buffer_id).is_some_and(|buffer| {
+                buffer
+                    .read(cx)
+                    .file()
+                    .is_some_and(|file| file.worktree_id(cx) == worktree_id)
+            })
+        })
+    }
+
+    fn schedule_closed_worktree_shutdown(
+        &mut self,
+        worktree_id: WorktreeId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.worktree_has_registered_buffers(worktree_id, cx) {
+            return;
+        }
+        let task = cx.spawn(async move |lsp_store, cx| {
+            cx.background_executor()
+                .timer(CLOSED_WORKTREE_LANGUAGE_SERVER_GRACE)
+                .await;
+            lsp_store
+                .update(cx, |lsp_store, cx| {
+                    lsp_store.stop_closed_worktree_language_servers(worktree_id, cx);
+                })
+                .ok();
+        });
+        if let Some(local) = self.as_local_mut() {
+            local
+                .worktree_language_server_shutdown_tasks
+                .retain(|_, task| !task.is_ready());
+            local
+                .worktree_language_server_shutdown_tasks
+                .insert(worktree_id, task);
+        }
+    }
+
+    fn stop_closed_worktree_language_servers(
+        &mut self,
+        worktree_id: WorktreeId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.worktree_has_registered_buffers(worktree_id, cx) {
+            return;
+        }
+        let Some(local) = self.as_local() else {
+            return;
+        };
+        let servers_with_open_buffers = local
+            .buffers_opened_in_servers
+            .values()
+            .flatten()
+            .copied()
+            .collect::<HashSet<_>>();
+        // Starting servers have no opened buffers yet, so only running ones are idle.
+        let idle_servers = local
+            .language_server_ids
+            .iter()
+            .filter(|(seed, state)| {
+                seed.worktree_id == worktree_id
+                    && !servers_with_open_buffers.contains(&state.id)
+                    && local.running_language_server_for_id(state.id).is_some()
+            })
+            .map(|(_, state)| LanguageServerSelector::Id(state.id))
+            .collect::<HashSet<_>>();
+        if idle_servers.is_empty() {
+            return;
+        }
+        let (_, task) = self.stop_local_language_servers_for_buffers(&[], idle_servers, cx);
+        task.detach();
     }
 
     pub fn stop_all_language_servers(&mut self, cx: &mut Context<Self>) {
