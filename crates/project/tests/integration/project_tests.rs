@@ -3406,7 +3406,8 @@ async fn test_idle_language_servers_stop_and_resume(cx: &mut gpui::TestAppContex
     init_test(cx);
 
     let fs = FakeFs::new(cx.executor());
-    fs.insert_tree(path!("/dir"), json!({ "a.rs": "" })).await;
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "", "b.rs": "" }))
+        .await;
     let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
     let language_registry = project.read_with(cx, |project, _| project.languages().clone());
     language_registry.add(rust_lang());
@@ -3435,6 +3436,15 @@ async fn test_idle_language_servers_stop_and_resume(cx: &mut gpui::TestAppContex
     cx.executor().run_until_parked();
     assert_eq!(server_count(cx), 0);
 
+    let (_other_buffer, other_handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/b.rs"), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+    assert_eq!(server_count(cx), 0);
+
     project.update(cx, |project, cx| {
         project
             .lsp_store()
@@ -3444,12 +3454,55 @@ async fn test_idle_language_servers_stop_and_resume(cx: &mut gpui::TestAppContex
     cx.executor().run_until_parked();
     assert_eq!(server_count(cx), 1);
 
-    cx.update(|_| drop(handle));
+    cx.update(|_| {
+        drop(handle);
+        drop(other_handle);
+    });
     cx.executor().run_until_parked();
     assert_eq!(server_count(cx), 1);
     cx.executor().advance_clock(Duration::from_secs(61));
     cx.executor().run_until_parked();
     assert_eq!(server_count(cx), 0);
+}
+
+#[gpui::test]
+async fn test_suspended_project_without_servers_does_not_start_them(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "" })).await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut fake_servers = language_registry.register_fake_lsp("Rust", FakeLspAdapter::default());
+    let server_count = |cx: &mut gpui::TestAppContext| {
+        project.read_with(cx, |project, cx| {
+            project.language_server_statuses(cx).count()
+        })
+    };
+
+    project.update(cx, |project, cx| {
+        project
+            .lsp_store()
+            .update(cx, |lsp_store, cx| lsp_store.suspend_language_servers(cx));
+    });
+    let (_buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+    assert_eq!(server_count(cx), 0);
+
+    project.update(cx, |project, cx| {
+        project
+            .lsp_store()
+            .update(cx, |lsp_store, cx| lsp_store.resume_language_servers(cx));
+    });
+    fake_servers.next().await.unwrap();
+    cx.executor().run_until_parked();
+    assert_eq!(server_count(cx), 1);
 }
 
 #[gpui::test]

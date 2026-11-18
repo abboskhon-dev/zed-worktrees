@@ -438,7 +438,7 @@ impl LocalLspStore {
             Some(state.id)
         } else {
             if start_mode == LanguageServerStartMode::Automatic
-                && !self.can_start_language_server(&key.name)
+                && (self.language_servers_suspended || !self.can_start_language_server(&key.name))
             {
                 return None;
             }
@@ -13023,10 +13023,10 @@ impl LspStore {
         let Some(local) = self.as_local_mut() else {
             return;
         };
+        local.language_servers_suspended = true;
         if local.language_server_ids.is_empty() {
             return;
         }
-        local.language_servers_suspended = true;
         local.worktree_language_server_shutdown_tasks.clear();
         self.shutdown_all_language_servers(cx).detach();
     }
